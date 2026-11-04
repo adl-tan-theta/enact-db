@@ -498,7 +498,7 @@ async fn quack_protocol() {
     std::fs::write(
         dir.path().join("cfg.toml"),
         format!(
-            "[server]\nlisten = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\n[quack]\ntoken = \"duck-secret\"\n\
+            "[server]\nlisten = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\n[auth]\nadmin_token = \"duck-secret\"\n\
              [[sources]]\nkind = \"csv\"\nname = \"customers\"\nlocation = \"{}\"\n",
             dir.path().join("data").display(),
             dir.path().join("customers.csv").display()
@@ -521,12 +521,14 @@ async fn quack_protocol() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    reqwest::Client::new()
+    let r = reqwest::Client::new()
         .put(format!("{base}/v1/agents/analyst/kv/tags"))
+        .bearer_auth("duck-secret")
         .json(&json!(["vip", "eu"]))
         .send()
         .await
         .unwrap();
+    assert!(r.status().is_success());
     let url = format!("{base}/quack");
 
     // auth

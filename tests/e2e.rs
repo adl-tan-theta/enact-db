@@ -274,7 +274,8 @@ async fn end_to_end() {
         .unwrap();
     let t: Value = http.get(format!("{b}/v1/transcripts/s1")).send().await.unwrap().json().await.unwrap();
     assert_eq!(t["entries"].as_array().unwrap().len(), 2);
-    assert_eq!(t["entries"][0]["actor"], "human:alice");
+    // identity comes from the token, not from a client-supplied X-Actor header
+    assert_eq!(t["entries"][0]["actor"], "human:admin");
 
     // --- blob tier: artifacts + sandbox push
     http.put(format!("{b}/v1/blob/reports/q3.txt")).body("Q3 report").send().await.unwrap();

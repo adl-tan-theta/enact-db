@@ -29,7 +29,13 @@ fn schema(fields: &[(&str, DataType)]) -> Arc<Schema> {
     Arc::new(Schema::new(fields.iter().map(|(n, t)| Field::new(*n, t.clone(), true)).collect::<Vec<_>>()))
 }
 
-pub fn register(ctx: &SessionContext, agents: Arc<AgentRegistry>, hub: Arc<Hub>, store: Arc<HubStore>) -> Result<()> {
+pub fn register(
+    ctx: &SessionContext,
+    agents: Arc<AgentRegistry>,
+    hub: Arc<Hub>,
+    store: Arc<HubStore>,
+    authz: Arc<crate::authz::Authz>,
+) -> Result<()> {
     let catalog = ctx.catalog("gateway").expect("default catalog");
     catalog.register_schema("system", Arc::new(MemorySchemaProvider::new()))?;
 
@@ -179,5 +185,75 @@ pub fn register(ctx: &SessionContext, agents: Arc<AgentRegistry>, hub: Arc<Hub>,
         })
     });
     ctx.register_table("system.transcripts", Arc::new(LiveTable::new(sch, loader)))?;
+    // audit_log (authorization decisions and permission changes) ------------------------
+    let sch = schema(&[
+        ("version", DataType::Int64),
+        ("ts_ms", DataType::Int64),
+        ("principal", DataType::Utf8),
+        ("acting_for", DataType::Utf8),
+        ("source", DataType::Utf8),
+        ("action", DataType::Utf8),
+        ("resource", DataType::Utf8),
+        ("decision", DataType::Utf8),
+        ("determined_by", DataType::Utf8),
+        ("reason", DataType::Utf8),
+        ("user_agent", DataType::Utf8),
+        ("detail", DataType::Utf8),
+    ]);
+    let (az, sc) = (authz.clone(), sch.clone());
+    let loader: Loader = Arc::new(move || {
+        let (az, sc) = (az.clone(), sc.clone());
+        Box::pin(async move {
+            az.flush_audit().await;
+            let rows = az.audit_events(1_000_000).await?;
+            Ok(RecordBatch::try_new(
+                sc,
+                vec![
+                    i(rows.iter().map(|e| Some(e.version)).collect()),
+                    i(rows.iter().map(|e| Some(e.ts_ms)).collect()),
+                    s(rows.iter().map(|e| Some(e.principal.clone())).collect()),
+                    s(rows.iter().map(|e| e.acting_for.clone()).collect()),
+                    s(rows.iter().map(|e| Some(e.source.clone())).collect()),
+                    s(rows.iter().map(|e| Some(e.action.clone())).collect()),
+                    s(rows.iter().map(|e| Some(e.resource.clone())).collect()),
+                    s(rows.iter().map(|e| Some(e.decision.clone())).collect()),
+                    s(rows.iter().map(|e| e.determined_by.clone()).collect()),
+                    s(rows.iter().map(|e| e.reason.clone()).collect()),
+                    s(rows.iter().map(|e| e.user_agent.clone()).collect()),
+                    s(rows.iter().map(|e| e.detail.as_ref().map(|d| d.to_string())).collect()),
+                ],
+            )?)
+        })
+    });
+    ctx.register_table("system.audit_log", Arc::new(LiveTable::new(sch, loader)))?;
+
+    // grants (permissions as data) ------------------------------------------------------
+    let sch = schema(&[
+        ("id", DataType::Int64),
+        ("principal", DataType::Utf8),
+        ("resource", DataType::Utf8),
+        ("privilege", DataType::Utf8),
+        ("granted_by", DataType::Utf8),
+        ("created_at", DataType::Int64),
+    ]);
+    let (az, sc) = (authz, sch.clone());
+    let loader: Loader = Arc::new(move || {
+        let (az, sc) = (az.clone(), sc.clone());
+        Box::pin(async move {
+            let rows = az.list_grants(None, true, None);
+            Ok(RecordBatch::try_new(
+                sc,
+                vec![
+                    i(rows.iter().map(|g| Some(g.id)).collect()),
+                    s(rows.iter().map(|g| Some(g.principal.clone())).collect()),
+                    s(rows.iter().map(|g| Some(g.resource.clone())).collect()),
+                    s(rows.iter().map(|g| Some(g.privilege.as_str().to_string())).collect()),
+                    s(rows.iter().map(|g| Some(g.granted_by.clone())).collect()),
+                    i(rows.iter().map(|g| Some(g.created_at)).collect()),
+                ],
+            )?)
+        })
+    });
+    ctx.register_table("system.grants", Arc::new(LiveTable::new(sch, loader)))?;
     Ok(())
 }

@@ -4,7 +4,7 @@
 [server]
 listen = "127.0.0.1:9494"
 data_dir = "./data"
-# auth_token = "change-me"        # or ENACT_DB_TOKEN env / --token
+# auth_token = "change-me"        # break-glass admin token (same as [auth] admin_token)
 allow_sql_writes = false          # reject DDL/DML through /v1/query
 max_rows = 10000
 
@@ -80,8 +80,48 @@ interval_ms = 1000
 # Quack (DuckDB client-server protocol) on the same port:
 #   ATTACH 'quack:localhost:9494' AS gw;  FROM gw.sales;  FROM gw.system.agent_tool_calls;
 # ---------------------------------------------------------------------------
-# [quack]
-# token = "duck-secret"            # defaults to [server] auth_token; unset = open (local dev)
+# DuckDB's quack secret TOKEN is any enact-db credential (API token, OIDC JWT, admin token).
+
+# ---------------------------------------------------------------------------
+# Apache Iceberg REST catalogs (Lakekeeper, Polaris / Snowflake Open Catalog, Unity, Nessie)
+# ---------------------------------------------------------------------------
+# [[iceberg]]
+# name = "lake"                    # -> lake.<namespace>.<table>
+# uri = "http://lakekeeper:8181/catalog"
+# warehouse = "prod"
+# credential_env = "LAKE_CLIENT_CREDENTIALS"   # "client_id:client_secret" (OAuth2) or token_env = "..."
+# scope = "lakekeeper"
+# props = { "s3.endpoint" = "http://minio:9000", "s3.region" = "us-east-1" }
+# refresh_secs = 60
+
+# ---------------------------------------------------------------------------
+# Permissions (Lakekeeper-style). Without [auth] the server runs in open mode
+# (loopback only).
+# ---------------------------------------------------------------------------
+# [auth]
+# admin_token = "change-me"        # break-glass; bypasses checks, always audited
+# allow_anonymous = false
+#
+# [auth.oidc]
+# issuer = "https://login.microsoftonline.com/<tenant>/v2.0"
+# audience = ["api://enact-db"]
+# roles_claim = "roles"            # -> role:oidc:<value>
+# agent_claim = { claim = "idtyp", value = "app" }
+# required_claims = { tid = "<tenant-id>" }   # admission gate
+#
+# [[auth.roles]]
+# id = "analysts"
+# members = ["user:alice@contoso.com"]
+#
+# [[auth.grants]]
+# principal = "role:analysts"
+# resource = "schema:gateway/public"   # subtree: every table in the schema
+# privilege = "select"
+#
+# [[auth.grants]]
+# principal = "role:oidc:member"
+# resource = "docs"
+# privilege = "create"             # members may start documents (and own them)
 
 # [[sources]]
 # kind = "snowflake"               # needs --features snowflake + the ADBC Snowflake driver

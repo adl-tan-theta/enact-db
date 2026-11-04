@@ -12,11 +12,13 @@
 //! | Transcripts | `POST /v1/transcripts` · `GET /v1/transcripts/{session}`  |
 //! | Artifacts   | `GET/PUT /v1/blob/{*path}` · `GET /v1/blob`               |
 //!
-//! Callers identify themselves with `X-Agent-Id: <id>` (agents) and/or
-//! `X-Actor: <name>` (humans). Agent writes are audited into that agent's
-//! AgentFS `tool_calls` table.
+//! Every request is authenticated into a [`Caller`] (see `authz::authn`) and
+//! every handler checks the privilege it needs on the resource it touches
+//! (see `authz`). `X-Agent-Id: <id>` acts as an agent (needs `assume`).
+//! Agent writes are also recorded in that agent's AgentFS `tool_calls` table.
 
 use crate::agents::{self, now_secs, AgentRegistry};
+use crate::authz::{table_resource, Caller, Privilege};
 use crate::blob::Blob;
 use crate::config::ServerConfig;
 use crate::crdt::{Frame, Hub};
@@ -24,9 +26,9 @@ use crate::memory::{MemoryQuery, MemoryRecord, MemoryStore};
 use crate::store::{HubStore, TranscriptEntry};
 use axum::body::Bytes;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware::{self, Next};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -55,15 +57,19 @@ pub struct AppState {
     pub sinks: Vec<String>,
     pub peer_seq: AtomicU64,
     pub quack: Arc<crate::quack::QuackServer>,
+    pub authz: Arc<crate::authz::Authz>,
 }
 
 type St = State<Arc<AppState>>;
 
 // ---- errors ---------------------------------------------------------------------
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
+    pub fn new(code: StatusCode, msg: impl Into<String>) -> Self {
+        Self(code, msg.into())
+    }
     pub fn bad(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, msg.into())
     }
@@ -99,23 +105,6 @@ impl From<agentfs_sdk::error::Error> for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
-fn agent_header(h: &HeaderMap) -> Option<String> {
-    h.get("x-agent-id").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
-}
-
-fn actor_header(h: &HeaderMap) -> Option<String> {
-    h.get("x-actor").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
-}
-
-/// CRDT origin tag for an HTTP caller.
-fn http_origin(h: &HeaderMap) -> String {
-    match (agent_header(h), actor_header(h)) {
-        (Some(a), _) => format!("agent:{a}"),
-        (None, Some(u)) => format!("human:{u}"),
-        _ => "http".into(),
-    }
-}
-
 // ---- router -----------------------------------------------------------------------
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -146,7 +135,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/blob", get(blob_list))
         .route("/v1/blob/{*path}", get(blob_get).put(blob_put))
         .route("/ws/{doc}", get(ws_upgrade))
-        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .merge(crate::authz::api::routes())
+        .layer(middleware::from_fn_with_state(state.clone(), crate::authz::api::middleware))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024));
 
     Router::new()
@@ -168,48 +158,38 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-async fn auth(State(st): St, req: Request, next: Next) -> Response {
-    if let Some(token) = &st.cfg.auth_token {
-        let bearer = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        // Browsers can't set headers on WebSocket upgrades, so also accept ?token=
-        let query_tok = req.uri().query().and_then(|q| {
-            url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "token").map(|(_, v)| v.into_owned())
-        });
-        let ok = bearer == Some(token.as_str()) || query_tok.as_deref() == Some(token.as_str());
-        if !ok {
-            return ApiError(StatusCode::UNAUTHORIZED, "missing or invalid token".into()).into_response();
+async fn info(State(st): St, caller: Caller) -> ApiResult<Json<Value>> {
+    let az = &st.authz;
+    let mut tables = vec![];
+    for c in st.ctx.catalog_names() {
+        let Some(cat) = st.ctx.catalog(&c) else { continue };
+        for s in cat.schema_names().into_iter().filter(|s| s != "information_schema") {
+            let Some(schema) = cat.schema(&s) else { continue };
+            for t in schema.table_names() {
+                if az.visible(&caller, &table_resource(&c, &s, &t)) {
+                    tables.push(json!({"catalog": c, "schema": s, "table": t}));
+                }
+            }
         }
     }
-    next.run(req).await
-}
-
-async fn info(State(st): St) -> ApiResult<Json<Value>> {
-    let tables = run_sql_json(
-        &st.ctx,
-        "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-         WHERE table_schema NOT IN ('information_schema') ORDER BY 1, 2",
-        10_000,
-        true,
-    )
-    .await?;
+    tables.sort_by_key(|v| v.to_string());
+    let agents: Vec<String> =
+        st.agents.list_ids()?.into_iter().filter(|a| az.visible(&caller, &format!("agent:{a}"))).collect();
     Ok(Json(json!({
         "name": "enact-db",
         "version": env!("CARGO_PKG_VERSION"),
         "features": {
             "azure": cfg!(feature = "azure"), "postgres": cfg!(feature = "postgres"),
             "snowflake": cfg!(feature = "snowflake"), "duckdb": cfg!(feature = "duckdb"),
-            "lancedb": cfg!(feature = "lancedb"),
+            "lancedb": cfg!(feature = "lancedb"), "iceberg": cfg!(feature = "iceberg"),
         },
+        "caller": caller.principal,
         "sources": st.sources,
-        "tables": tables["rows"],
+        "tables": tables,
         "memory_backend": st.memory.backend_name(),
         "transcript_sinks": st.sinks,
         "blob": st.blob.as_ref().map(|b| b.url.clone()),
-        "agents": st.agents.list_ids()?,
+        "agents": agents,
     })))
 }
 
@@ -222,18 +202,66 @@ struct QueryReq {
     format: Option<String>,
 }
 
-async fn run_sql_batches(ctx: &SessionContext, sql: &str, allow_writes: bool) -> ApiResult<Vec<RecordBatch>> {
-    let opts = SQLOptions::new()
+/// Plan SQL, enforce read-only (unless enabled), and check `select` on every
+/// table the plan touches (including subqueries). DDL/DML additionally needs
+/// `ownership` on `server`.
+pub async fn authorized_plan(
+    ctx: &SessionContext,
+    authz: &crate::authz::Authz,
+    caller: &Caller,
+    sql: &str,
+    allow_writes: bool,
+) -> ApiResult<datafusion::logical_expr::LogicalPlan> {
+    let plan = ctx.state().create_logical_plan(sql).await?;
+    SQLOptions::new()
         .with_allow_ddl(allow_writes)
         .with_allow_dml(allow_writes)
-        .with_allow_statements(allow_writes);
-    let df = ctx.sql_with_options(sql, opts).await?;
-    Ok(df.collect().await?)
+        .with_allow_statements(allow_writes)
+        .verify_plan(&plan)?;
+    use datafusion::logical_expr::LogicalPlan;
+    if matches!(plan, LogicalPlan::Ddl(_) | LogicalPlan::Dml(_) | LogicalPlan::Statement(_) | LogicalPlan::Copy(_)) {
+        authz.require(caller, Privilege::Ownership, "server")?;
+    }
+    for (need, res) in crate::authz::plan_resources(&plan) {
+        authz.require(caller, need, &res)?;
+    }
+    Ok(plan)
 }
 
-async fn run_sql_json(ctx: &SessionContext, sql: &str, max_rows: usize, allow_writes: bool) -> ApiResult<Value> {
-    let batches = run_sql_batches(ctx, sql, allow_writes).await?;
-    batches_to_json(&batches, max_rows)
+async fn query(State(st): St, caller: Caller, Json(req): Json<QueryReq>) -> ApiResult<Response> {
+    let started = now_secs();
+    let result: ApiResult<Vec<RecordBatch>> = async {
+        let plan = authorized_plan(&st.ctx, &st.authz, &caller, &req.sql, st.cfg.allow_sql_writes).await?;
+        Ok(st.ctx.execute_logical_plan(plan).await?.collect().await?)
+    }
+    .await;
+    if let Some(agent) = caller.agent_id() {
+        if let Ok(afs) = st.agents.get(agent).await {
+            let outcome = match &result {
+                Ok(b) => Ok(json!({"rows": b.iter().map(|b| b.num_rows()).sum::<usize>()})),
+                Err(e) => Err(e.1.clone()),
+            };
+            st.agents.audit(&afs, "sql.query", json!({"sql": req.sql}), started, outcome).await;
+        }
+    }
+    let batches = result?;
+    if req.format.as_deref() == Some("arrow") {
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+        let mut buf = vec![];
+        {
+            let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+                .map_err(|e| ApiError::bad(e.to_string()))?;
+            for b in &batches {
+                w.write(b).map_err(|e| ApiError::bad(e.to_string()))?;
+            }
+            w.finish().map_err(|e| ApiError::bad(e.to_string()))?;
+        }
+        return Ok(([(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")], buf).into_response());
+    }
+    Ok(Json(batches_to_json(&batches, st.cfg.max_rows)?).into_response())
 }
 
 fn batches_to_json(batches: &[RecordBatch], max_rows: usize) -> ApiResult<Value> {
@@ -267,51 +295,32 @@ fn batches_to_json(batches: &[RecordBatch], max_rows: usize) -> ApiResult<Value>
     Ok(json!({ "columns": columns, "rows": rows, "row_count": total, "truncated": total > n }))
 }
 
-async fn query(State(st): St, headers: HeaderMap, Json(req): Json<QueryReq>) -> ApiResult<Response> {
-    let started = now_secs();
-    let result = run_sql_batches(&st.ctx, &req.sql, st.cfg.allow_sql_writes).await;
-    if let Some(agent) = agent_header(&headers) {
-        if let Ok(afs) = st.agents.get(&agent).await {
-            let outcome = match &result {
-                Ok(b) => Ok(json!({"rows": b.iter().map(|b| b.num_rows()).sum::<usize>()})),
-                Err(e) => Err(e.1.clone()),
-            };
-            st.agents.audit(&afs, "sql.query", json!({"sql": req.sql}), started, outcome).await;
-        }
-    }
-    let batches = result?;
-    if req.format.as_deref() == Some("arrow") {
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-        let mut buf = vec![];
-        {
-            let mut w = datafusion::arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
-                .map_err(|e| ApiError::bad(e.to_string()))?;
-            for b in &batches {
-                w.write(b).map_err(|e| ApiError::bad(e.to_string()))?;
-            }
-            w.finish().map_err(|e| ApiError::bad(e.to_string()))?;
-        }
-        return Ok(([(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")], buf).into_response());
-    }
-    Ok(Json(batches_to_json(&batches, st.cfg.max_rows)?).into_response())
-}
-
 // ---- agents: filesystem / kv / audit ------------------------------------------------
 
-async fn list_agents(State(st): St) -> ApiResult<Json<Value>> {
-    let ids = st.agents.list_ids()?;
-    let open = st.agents.open_ids().await;
+/// Sandbox access: an agent owns its own sandbox; creating someone else's needs
+/// `create` on `agents` (and makes the creator its owner).
+async fn agent_access(st: &AppState, caller: &Caller, id: &str, need: Privilege) -> ApiResult<()> {
+    if !agents::valid_agent_id(id) {
+        return Err(ApiError::bad(format!("invalid agent id '{id}'")));
+    }
+    let exists = st.agents.exists(id).await;
+    st.authz.require_or_create(caller, need, &format!("agent:{id}"), "agents", exists).await?;
+    Ok(())
+}
+
+async fn list_agents(State(st): St, caller: Caller) -> ApiResult<Json<Value>> {
+    let ids: Vec<String> =
+        st.agents.list_ids()?.into_iter().filter(|a| st.authz.visible(&caller, &format!("agent:{a}"))).collect();
+    let open: Vec<String> = st.agents.open_ids().await.into_iter().filter(|a| ids.contains(a)).collect();
     Ok(Json(json!({ "agents": ids, "open": open })))
 }
 
-async fn fs_root(st: St, Path(id): Path<String>) -> ApiResult<Response> {
-    fs_get(st, Path((id, String::new()))).await
+async fn fs_root(st: St, caller: Caller, Path(id): Path<String>) -> ApiResult<Response> {
+    fs_get(st, caller, Path((id, String::new()))).await
 }
 
-async fn fs_get(State(st): St, Path((id, path)): Path<(String, String)>) -> ApiResult<Response> {
+async fn fs_get(State(st): St, caller: Caller, Path((id, path)): Path<(String, String)>) -> ApiResult<Response> {
+    agent_access(&st, &caller, &id, Privilege::Select).await?;
     let afs = st.agents.get(&id).await?;
     let path = agents::normalize(&path)?;
     let stat = afs.fs.stat(&path).await?.ok_or_else(|| ApiError::not_found(format!("{path} not found")))?;
@@ -335,20 +344,20 @@ async fn fs_get(State(st): St, Path((id, path)): Path<(String, String)>) -> ApiR
 
 async fn fs_put(
     State(st): St,
+    caller: Caller,
     Path((id, path)): Path<(String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     let path = agents::normalize(&path)?;
     let started = now_secs();
     let r = agents::write_file(&afs, &path, &body).await;
-    let actor = agent_header(&headers).or_else(|| actor_header(&headers));
     st.agents
         .audit(
             &afs,
             "fs.write",
-            json!({"path": path, "bytes": body.len(), "actor": actor}),
+            json!({"path": path, "bytes": body.len(), "actor": caller.principal, "acting_for": caller.acting_for}),
             started,
             r.as_ref().map(|_| json!("ok")).map_err(|e| e.to_string()),
         )
@@ -357,7 +366,8 @@ async fn fs_put(
     Ok(Json(json!({ "path": path, "bytes": body.len() })))
 }
 
-async fn fs_delete(State(st): St, Path((id, path)): Path<(String, String)>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+async fn fs_delete(State(st): St, caller: Caller, Path((id, path)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     let path = agents::normalize(&path)?;
     let started = now_secs();
@@ -366,7 +376,7 @@ async fn fs_delete(State(st): St, Path((id, path)): Path<(String, String)>, head
         .audit(
             &afs,
             "fs.remove",
-            json!({"path": path, "actor": agent_header(&headers)}),
+            json!({"path": path, "actor": caller.principal}),
             started,
             r.as_ref().map(|_| json!("ok")).map_err(|e| e.to_string()),
         )
@@ -375,19 +385,22 @@ async fn fs_delete(State(st): St, Path((id, path)): Path<(String, String)>, head
     Ok(Json(json!({ "removed": path })))
 }
 
-async fn fs_mkdir(State(st): St, Path((id, path)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn fs_mkdir(State(st): St, caller: Caller, Path((id, path)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     let path = agents::normalize(&path)?;
     agents::ensure_parents(&afs, &format!("{path}/x")).await?;
     Ok(Json(json!({ "created": path })))
 }
 
-async fn kv_list(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+async fn kv_list(State(st): St, caller: Caller, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::Select).await?;
     let afs = st.agents.get(&id).await?;
     Ok(Json(json!({ "keys": afs.kv.keys().await? })))
 }
 
-async fn kv_get(State(st): St, Path((id, key)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn kv_get(State(st): St, caller: Caller, Path((id, key)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::Select).await?;
     let afs = st.agents.get(&id).await?;
     let v: Option<Value> = afs.kv.get(&key).await?;
     v.map(Json).ok_or_else(|| ApiError::not_found(format!("key {key} not found")))
@@ -395,10 +408,11 @@ async fn kv_get(State(st): St, Path((id, key)): Path<(String, String)>) -> ApiRe
 
 async fn kv_put(
     State(st): St,
+    caller: Caller,
     Path((id, key)): Path<(String, String)>,
-    headers: HeaderMap,
     Json(v): Json<Value>,
 ) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     let started = now_secs();
     let r = afs.kv.set(&key, &v).await;
@@ -406,7 +420,7 @@ async fn kv_put(
         .audit(
             &afs,
             "kv.set",
-            json!({"key": key, "actor": agent_header(&headers)}),
+            json!({"key": key, "actor": caller.principal}),
             started,
             r.as_ref().map(|_| json!("ok")).map_err(|e| e.to_string()),
         )
@@ -415,7 +429,8 @@ async fn kv_put(
     Ok(Json(json!({ "key": key })))
 }
 
-async fn kv_delete(State(st): St, Path((id, key)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn kv_delete(State(st): St, caller: Caller, Path((id, key)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     afs.kv.delete(&key).await?;
     Ok(Json(json!({ "deleted": key })))
@@ -426,7 +441,8 @@ struct Limit {
     limit: Option<i64>,
 }
 
-async fn tools_recent(State(st): St, Path(id): Path<String>, Query(l): Query<Limit>) -> ApiResult<Json<Value>> {
+async fn tools_recent(State(st): St, caller: Caller, Path(id): Path<String>, Query(l): Query<Limit>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::Select).await?;
     let afs = st.agents.get(&id).await?;
     let calls = afs.tools.recent(Some(l.limit.unwrap_or(100))).await?;
     Ok(Json(json!({ "tool_calls": calls })))
@@ -447,7 +463,8 @@ struct ToolRecord {
     completed_at: Option<i64>,
 }
 
-async fn tools_record(State(st): St, Path(id): Path<String>, Json(t): Json<ToolRecord>) -> ApiResult<Json<Value>> {
+async fn tools_record(State(st): St, caller: Caller, Path(id): Path<String>, Json(t): Json<ToolRecord>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::WriteData).await?;
     let afs = st.agents.get(&id).await?;
     let now = now_secs();
     let rid = afs
@@ -468,16 +485,15 @@ fn need_blob(st: &AppState) -> ApiResult<Arc<Blob>> {
     st.blob.clone().ok_or_else(|| ApiError::bad("no [blob] url configured"))
 }
 
-async fn agent_push(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+async fn agent_push(State(st): St, caller: Caller, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::Modify).await?;
     let blob = need_blob(&st)?;
     let n = blob.push_agent(&st.agents, &id).await?;
     Ok(Json(json!({ "agent": id, "bytes": n, "blob": format!("{}/agents/{id}.db", blob.url) })))
 }
 
-async fn agent_pull(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    if !agents::valid_agent_id(&id) {
-        return Err(ApiError::bad("invalid agent id"));
-    }
+async fn agent_pull(State(st): St, caller: Caller, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    agent_access(&st, &caller, &id, Privilege::Modify).await?;
     let blob = need_blob(&st)?;
     let n = blob.pull_agent(&st.agents, &id).await?;
     Ok(Json(json!({ "agent": id, "bytes": n })))
@@ -485,14 +501,38 @@ async fn agent_pull(State(st): St, Path(id): Path<String>) -> ApiResult<Json<Val
 
 // ---- CRDT documents ----------------------------------------------------------------
 
-async fn docs_list(State(st): St) -> ApiResult<Json<Value>> {
-    let stats = st.store.doc_stats().await?;
-    let loaded: HashMap<String, usize> =
-        st.hub.loaded_rooms().await.into_iter().map(|r| (r.id.clone(), r.peer_count())).collect();
+/// Document access; opening a new document needs `create` on `docs` and makes
+/// the caller its owner.
+async fn doc_access(st: &AppState, caller: &Caller, doc: &str, need: Privilege) -> ApiResult<()> {
+    if !crate::crdt::valid_doc_id(doc) {
+        return Err(ApiError::bad(format!("invalid document id '{doc}'")));
+    }
+    let exists = st.hub.exists(doc).await?;
+    st.authz.require_or_create(caller, need, &format!("doc:{doc}"), "docs", exists).await?;
+    Ok(())
+}
+
+async fn docs_list(State(st): St, caller: Caller) -> ApiResult<Json<Value>> {
+    let stats: Vec<_> = st
+        .store
+        .doc_stats()
+        .await?
+        .into_iter()
+        .filter(|d| st.authz.visible(&caller, &format!("doc:{}", d.doc_id)))
+        .collect();
+    let loaded: HashMap<String, usize> = st
+        .hub
+        .loaded_rooms()
+        .await
+        .into_iter()
+        .filter(|r| st.authz.visible(&caller, &format!("doc:{}", r.id)))
+        .map(|r| (r.id.clone(), r.peer_count()))
+        .collect();
     Ok(Json(json!({ "persisted": stats, "live": loaded })))
 }
 
-async fn doc_get(State(st): St, Path(doc): Path<String>) -> ApiResult<Json<Value>> {
+async fn doc_get(State(st): St, caller: Caller, Path(doc): Path<String>) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let txn = d.transact();
@@ -514,7 +554,8 @@ async fn doc_get(State(st): St, Path(doc): Path<String>) -> ApiResult<Json<Value
     Ok(Json(json!({ "doc": doc, "peers": room.peer_count(), "roots": roots, "presence": presence })))
 }
 
-async fn text_get(State(st): St, Path((doc, name)): Path<(String, String)>) -> ApiResult<Response> {
+async fn text_get(State(st): St, caller: Caller, Path((doc, name)): Path<(String, String)>) -> ApiResult<Response> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let text = d.get_or_insert_text(name.as_str());
@@ -533,14 +574,15 @@ enum TextOp {
 
 async fn text_edit(
     State(st): St,
+    caller: Caller,
     Path((doc, name)): Path<(String, String)>,
-    headers: HeaderMap,
     Json(op): Json<TextOp>,
 ) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::WriteData).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let text = d.get_or_insert_text(name.as_str());
-    let origin = http_origin(&headers);
+    let origin = caller.origin();
     let (op_name, len) = {
         let mut txn = d.transact_mut_with(origin.clone());
         let len = text.len(&txn);
@@ -566,11 +608,12 @@ async fn text_edit(
         };
         (op_name, text.len(&txn))
     };
-    audit_doc(&st, &headers, &format!("doc.text.{op_name}"), json!({"doc": doc, "text": name})).await;
+    audit_doc(&st, &caller, &format!("doc.text.{op_name}"), json!({"doc": doc, "text": name})).await;
     Ok(Json(json!({ "doc": doc, "text": name, "len": len })))
 }
 
-async fn map_get(State(st): St, Path((doc, name)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn map_get(State(st): St, caller: Caller, Path((doc, name)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let map = d.get_or_insert_map(name.as_str());
@@ -582,15 +625,16 @@ async fn map_get(State(st): St, Path((doc, name)): Path<(String, String)>) -> Ap
 
 async fn map_patch(
     State(st): St,
+    caller: Caller,
     Path((doc, name)): Path<(String, String)>,
-    headers: HeaderMap,
     Json(patch): Json<serde_json::Map<String, Value>>,
 ) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::WriteData).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let map = d.get_or_insert_map(name.as_str());
     {
-        let mut txn = d.transact_mut_with(http_origin(&headers));
+        let mut txn = d.transact_mut_with(caller.origin());
         for (k, v) in &patch {
             if v.is_null() {
                 map.remove(&mut txn, k);
@@ -600,12 +644,13 @@ async fn map_patch(
             }
         }
     }
-    audit_doc(&st, &headers, "doc.map.patch", json!({"doc": doc, "map": name, "keys": patch.keys().collect::<Vec<_>>()}))
+    audit_doc(&st, &caller, "doc.map.patch", json!({"doc": doc, "map": name, "keys": patch.keys().collect::<Vec<_>>()}))
         .await;
     Ok(Json(json!({ "doc": doc, "map": name, "updated": patch.len() })))
 }
 
-async fn array_get(State(st): St, Path((doc, name)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn array_get(State(st): St, caller: Caller, Path((doc, name)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let arr = d.get_or_insert_array(name.as_str());
@@ -622,20 +667,21 @@ struct ArrayPush {
 
 async fn array_push(
     State(st): St,
+    caller: Caller,
     Path((doc, name)): Path<(String, String)>,
-    headers: HeaderMap,
     Json(p): Json<ArrayPush>,
 ) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::WriteData).await?;
     let room = st.hub.room(&doc).await?;
     let d = room.doc();
     let arr = d.get_or_insert_array(name.as_str());
     let any = yrs::Any::from_json(&p.push.to_string()).map_err(|e| ApiError::bad(e.to_string()))?;
     let len = {
-        let mut txn = d.transact_mut_with(http_origin(&headers));
+        let mut txn = d.transact_mut_with(caller.origin());
         arr.push_back(&mut txn, any);
         arr.len(&txn)
     };
-    audit_doc(&st, &headers, "doc.array.push", json!({"doc": doc, "array": name})).await;
+    audit_doc(&st, &caller, "doc.array.push", json!({"doc": doc, "array": name})).await;
     Ok(Json(json!({ "doc": doc, "array": name, "len": len })))
 }
 
@@ -645,7 +691,8 @@ struct SvQuery {
     sv: Option<String>,
 }
 
-async fn update_get(State(st): St, Path(doc): Path<String>, Query(q): Query<SvQuery>) -> ApiResult<Response> {
+async fn update_get(State(st): St, caller: Caller, Path(doc): Path<String>, Query(q): Query<SvQuery>) -> ApiResult<Response> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
     let room = st.hub.room(&doc).await?;
     let bytes = match q.sv {
         Some(sv) => {
@@ -659,10 +706,11 @@ async fn update_get(State(st): St, Path(doc): Path<String>, Query(q): Query<SvQu
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 
-async fn update_post(State(st): St, Path(doc): Path<String>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
+async fn update_post(State(st): St, caller: Caller, Path(doc): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::WriteData).await?;
     let room = st.hub.room(&doc).await?;
-    room.apply_update(&http_origin(&headers), &body)?;
-    audit_doc(&st, &headers, "doc.update", json!({"doc": doc, "bytes": body.len()})).await;
+    room.apply_update(&caller.origin(), &body)?;
+    audit_doc(&st, &caller, "doc.update", json!({"doc": doc, "bytes": body.len()})).await;
     Ok(Json(json!({ "doc": doc, "applied_bytes": body.len() })))
 }
 
@@ -672,16 +720,9 @@ struct Presence {
     state: Option<Value>,
 }
 
-async fn presence_put(
-    State(st): St,
-    Path(doc): Path<String>,
-    headers: HeaderMap,
-    Json(p): Json<Presence>,
-) -> ApiResult<Json<Value>> {
-    let who = agent_header(&headers)
-        .map(|a| format!("agent:{a}"))
-        .or_else(|| actor_header(&headers).map(|u| format!("human:{u}")))
-        .ok_or_else(|| ApiError::bad("X-Agent-Id or X-Actor header required"))?;
+async fn presence_put(State(st): St, caller: Caller, Path(doc): Path<String>, Json(p): Json<Presence>) -> ApiResult<Json<Value>> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
+    let who = caller.origin();
     let room = st.hub.room(&doc).await?;
     // Stable synthetic awareness client id per HTTP participant (high range to avoid Yjs ids).
     let client_id = (fxhash(&who) & 0x1F_FFFF_FFFF_FFFF) | 0x10_0000_0000_0000;
@@ -698,9 +739,10 @@ fn fxhash(s: &str) -> u64 {
     h
 }
 
-async fn audit_doc(st: &AppState, headers: &HeaderMap, name: &str, params: Value) {
-    if let Some(agent) = agent_header(headers) {
-        if let Ok(afs) = st.agents.get(&agent).await {
+/// Record an agent's action in its own AgentFS tool-call log.
+async fn audit_doc(st: &AppState, caller: &Caller, name: &str, params: Value) {
+    if let Some(agent) = caller.agent_id() {
+        if let Ok(afs) = st.agents.get(agent).await {
             st.agents.audit(&afs, name, params, now_secs(), Ok(json!("ok"))).await;
         }
     }
@@ -708,30 +750,17 @@ async fn audit_doc(st: &AppState, headers: &HeaderMap, name: &str, params: Value
 
 // ---- WebSocket (y-websocket compatible) ---------------------------------------------
 
-#[derive(Deserialize)]
-struct WsParams {
-    agent: Option<String>,
-    user: Option<String>,
-}
-
-async fn ws_upgrade(
-    State(st): St,
-    Path(doc): Path<String>,
-    Query(p): Query<WsParams>,
-    ws: WebSocketUpgrade,
-) -> ApiResult<Response> {
+async fn ws_upgrade(State(st): St, caller: Caller, Path(doc): Path<String>, ws: WebSocketUpgrade) -> ApiResult<Response> {
+    doc_access(&st, &caller, &doc, Privilege::Select).await?;
+    let can_write = st.authz.decide(&caller, Privilege::WriteData, &format!("doc:{doc}")).allowed;
     let room = st.hub.room(&doc).await?;
     let n = st.peer_seq.fetch_add(1, Ordering::Relaxed);
-    let origin = match (p.agent, p.user) {
-        (Some(a), _) => format!("agent:{a}#{n}"),
-        (None, Some(u)) => format!("human:{u}#{n}"),
-        _ => format!("ws#{n}"),
-    };
-    Ok(ws.max_message_size(64 * 1024 * 1024).on_upgrade(move |socket| peer(socket, room, origin)))
+    let origin = format!("{}#{n}", caller.origin());
+    Ok(ws.max_message_size(64 * 1024 * 1024).on_upgrade(move |socket| peer(socket, room, origin, can_write)))
 }
 
-async fn peer(socket: WebSocket, room: Arc<crate::crdt::Room>, origin: String) {
-    tracing::info!(doc = %room.id, peer = %origin, "peer connected");
+async fn peer(socket: WebSocket, room: Arc<crate::crdt::Room>, origin: String, can_write: bool) {
+    tracing::info!(doc = %room.id, peer = %origin, can_write, "peer connected");
     let (mut tx, mut rx) = socket.split();
     let mut bus = room.tx.subscribe();
     let mut my_clients: Vec<yrs::ClientID> = vec![];
@@ -754,7 +783,7 @@ async fn peer(socket: WebSocket, room: Arc<crate::crdt::Room>, origin: String) {
         tokio::select! {
             incoming = rx.next() => {
                 match incoming {
-                    Some(Ok(WsMessage::Binary(data))) => match room.handle(&origin, &data) {
+                    Some(Ok(WsMessage::Binary(data))) => match room.handle(&origin, &data, can_write) {
                         Ok(h) => {
                             for c in h.awareness_clients {
                                 if !my_clients.contains(&c) { my_clients.push(c); }
@@ -805,58 +834,71 @@ enum OneOrMany<T> {
     One(T),
 }
 
-async fn memory_upsert(
-    State(st): St,
-    headers: HeaderMap,
-    Json(body): Json<OneOrMany<MemoryRecord>>,
-) -> ApiResult<Json<Value>> {
+/// Memory namespace access; a new namespace needs `create` on `memories`.
+async fn memory_access(st: &AppState, caller: &Caller, ns: &str, need: Privilege) -> ApiResult<()> {
+    if ns.is_empty() || ns.contains(['/', ':']) {
+        return Err(ApiError::bad("invalid memory namespace"));
+    }
+    let res = format!("memory:{ns}");
+    let exists = st.authz.has_grants(&res);
+    st.authz.require_or_create(caller, need, &res, "memories", exists).await?;
+    Ok(())
+}
+
+async fn memory_upsert(State(st): St, caller: Caller, Json(body): Json<OneOrMany<MemoryRecord>>) -> ApiResult<Json<Value>> {
     let recs = match body {
         OneOrMany::One(r) => vec![r],
         OneOrMany::Many(v) => v,
     };
-    let agent = agent_header(&headers);
+    let mut namespaces: Vec<&str> = recs.iter().map(|r| r.namespace.as_str()).collect();
+    namespaces.sort();
+    namespaces.dedup();
+    for ns in namespaces {
+        memory_access(&st, &caller, ns, Privilege::WriteData).await?;
+    }
     for mut r in recs.clone() {
         if r.agent_id.is_none() {
-            r.agent_id = agent.clone();
+            r.agent_id = caller.agent_id().map(str::to_string);
         }
         st.memory.upsert(&r).await?;
     }
-    audit_doc(&st, &headers, "memory.upsert", json!({"count": recs.len()})).await;
+    audit_doc(&st, &caller, "memory.upsert", json!({"count": recs.len()})).await;
     Ok(Json(json!({ "upserted": recs.len(), "backend": st.memory.backend_name() })))
 }
 
-async fn memory_search(State(st): St, Json(q): Json<MemoryQuery>) -> ApiResult<Json<Value>> {
+async fn memory_search(State(st): St, caller: Caller, Json(q): Json<MemoryQuery>) -> ApiResult<Json<Value>> {
+    memory_access(&st, &caller, &q.namespace, Privilege::Select).await?;
     let hits = st.memory.search(&q).await?;
     Ok(Json(json!({ "hits": hits })))
 }
 
-async fn memory_delete(State(st): St, Path((ns, id)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+async fn memory_delete(State(st): St, caller: Caller, Path((ns, id)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    memory_access(&st, &caller, &ns, Privilege::WriteData).await?;
     let deleted = st.memory.delete(&ns, &id).await?;
     Ok(Json(json!({ "deleted": deleted })))
 }
 
 // ---- transcripts --------------------------------------------------------------------
 
-async fn transcripts_append(
-    State(st): St,
-    headers: HeaderMap,
-    Json(body): Json<OneOrMany<TranscriptEntry>>,
-) -> ApiResult<Json<Value>> {
+async fn transcripts_append(State(st): St, caller: Caller, Json(body): Json<OneOrMany<TranscriptEntry>>) -> ApiResult<Json<Value>> {
     let entries = match body {
         OneOrMany::One(e) => vec![e],
         OneOrMany::Many(v) => v,
     };
-    let default_actor = agent_header(&headers)
-        .map(|a| format!("agent:{a}"))
-        .or_else(|| actor_header(&headers).map(|u| format!("human:{u}")));
+    let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
+    sessions.sort();
+    sessions.dedup();
+    for s in &sessions {
+        if s.is_empty() || s.contains(['/', ':']) {
+            return Err(ApiError::bad("invalid session_id"));
+        }
+        let exists = st.store.session_exists(s).await?;
+        st.authz.require_or_create(&caller, Privilege::WriteData, &format!("transcript:{s}"), "transcripts", exists).await?;
+    }
     let mut seqs = vec![];
     for mut e in entries {
-        if e.session_id.is_empty() {
-            return Err(ApiError::bad("session_id required"));
-        }
-        if e.actor.is_none() {
-            e.actor = default_actor.clone();
-        }
+        // The caller's identity is authoritative; the client may not claim another actor.
+        e.actor = Some(caller.origin());
         seqs.push(st.store.transcript_append(&e).await?);
     }
     Ok(Json(json!({ "seqs": seqs })))
@@ -868,7 +910,8 @@ struct After {
     limit: Option<i64>,
 }
 
-async fn transcripts_get(State(st): St, Path(session): Path<String>, Query(a): Query<After>) -> ApiResult<Json<Value>> {
+async fn transcripts_get(State(st): St, caller: Caller, Path(session): Path<String>, Query(a): Query<After>) -> ApiResult<Json<Value>> {
+    st.authz.require(&caller, Privilege::Select, &format!("transcript:{session}"))?;
     let rows = st
         .store
         .transcripts_after(a.after.unwrap_or(0), a.limit.unwrap_or(1000).clamp(1, 10_000), Some(&session))
@@ -878,31 +921,44 @@ async fn transcripts_get(State(st): St, Path(session): Path<String>, Query(a): Q
 
 // ---- blob artifacts ------------------------------------------------------------------
 
-fn artifact_key(path: &str) -> ApiResult<String> {
+/// (object key, authz resource) for an artifact path.
+fn artifact(path: &str) -> ApiResult<(String, String)> {
     let p = agents::normalize(path)?;
-    Ok(format!("artifacts{p}"))
+    if p == "/" {
+        return Err(ApiError::bad("empty artifact path"));
+    }
+    Ok((format!("artifacts{p}"), format!("blob:{}", &p[1..])))
 }
 
-async fn blob_put(State(st): St, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> ApiResult<Json<Value>> {
+async fn blob_put(State(st): St, caller: Caller, Path(path): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
     let blob = need_blob(&st)?;
-    let key = artifact_key(&path)?;
+    let (key, res) = artifact(&path)?;
+    st.authz.require(&caller, Privilege::WriteData, &res)?;
     let n = body.len();
     blob.put(&key, body).await?;
-    audit_doc(&st, &headers, "blob.put", json!({"key": key, "bytes": n})).await;
+    audit_doc(&st, &caller, "blob.put", json!({"key": key, "bytes": n})).await;
     Ok(Json(json!({ "key": key, "bytes": n, "url": format!("{}/{key}", blob.url) })))
 }
 
-async fn blob_get(State(st): St, Path(path): Path<String>) -> ApiResult<Response> {
+async fn blob_get(State(st): St, caller: Caller, Path(path): Path<String>) -> ApiResult<Response> {
     let blob = need_blob(&st)?;
-    let key = artifact_key(&path)?;
+    let (key, res) = artifact(&path)?;
+    st.authz.require(&caller, Privilege::Select, &res)?;
     let data = blob.get(&key).await?.ok_or_else(|| ApiError::not_found(format!("{key} not found")))?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response())
 }
 
-async fn blob_list(State(st): St) -> ApiResult<Json<Value>> {
+async fn blob_list(State(st): St, caller: Caller) -> ApiResult<Json<Value>> {
     let blob = need_blob(&st)?;
     let items = blob.list("").await?;
-    let list: Vec<Value> = items.into_iter().map(|(k, s)| json!({"key": k, "size": s})).collect();
+    let list: Vec<Value> = items
+        .into_iter()
+        .filter(|(k, _)| match k.strip_prefix("artifacts/") {
+            Some(rest) => st.authz.decide(&caller, Privilege::Select, &format!("blob:{rest}")).allowed,
+            None => st.authz.decide(&caller, Privilege::Ownership, "server").allowed,
+        })
+        .map(|(k, s)| json!({"key": k, "size": s}))
+        .collect();
     Ok(Json(json!({ "url": blob.url, "objects": list })))
 }
 

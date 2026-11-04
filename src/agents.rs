@@ -65,6 +65,11 @@ impl AgentRegistry {
         Ok(afs)
     }
 
+    /// Does this agent's sandbox exist (on disk or open)?
+    pub async fn exists(&self, id: &str) -> bool {
+        valid_agent_id(id) && (self.open.read().await.contains_key(id) || self.db_path(id).exists())
+    }
+
     pub async fn is_open(&self, id: &str) -> bool {
         self.open.read().await.contains_key(id)
     }

@@ -7,6 +7,7 @@
 //! * Blob tier (Azure) for sandbox sync and agent artifacts
 
 mod agents;
+mod authz;
 mod blob;
 mod catalog;
 mod config;
@@ -60,18 +61,13 @@ struct Extra {
     #[serde(default)]
     blob: blob::BlobConfig,
     #[serde(default)]
-    quack: QuackConfig,
+    auth: authz::AuthConfig,
     #[cfg(feature = "iceberg")]
     #[serde(default)]
     iceberg: Vec<iceberg::IcebergConfig>,
 }
 
-#[derive(Deserialize, Default)]
-struct QuackConfig {
-    /// Token DuckDB clients must present (`CREATE SECRET (TYPE quack, TOKEN '...')`).
-    /// Defaults to [server] auth_token; with neither, the endpoint is open (local dev).
-    token: Option<String>,
-}
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -115,8 +111,22 @@ async fn main() -> Result<()> {
         anyhow::bail!("--pull-agent requires a [blob] url");
     }
 
+    // [server] auth_token / --token is the break-glass admin token unless [auth] sets one.
+    let mut auth_cfg = extra.auth.clone();
+    if auth_cfg.admin_token.is_none() {
+        auth_cfg.admin_token = cfg.server.auth_token.clone();
+    }
+    let authz = authz::Authz::open_store(&data_dir, auth_cfg).await?;
+    if authz.open && !cfg.server.listen.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to listen on {} without authentication: set [auth] admin_token (or --token / \
+             ENACT_DB_TOKEN) and/or [auth.oidc], or listen on 127.0.0.1",
+            cfg.server.listen
+        );
+    }
+
     let ctx = catalog::build_context(&cfg.sources).await?;
-    systables::register(&ctx, agents.clone(), hub.clone(), store.clone())?;
+    systables::register(&ctx, agents.clone(), hub.clone(), store.clone(), authz.clone())?;
     #[allow(unused_mut)]
     let mut sources: Vec<String> = cfg.sources.iter().map(|s| s.name().to_string()).collect();
     #[cfg(feature = "iceberg")]
@@ -124,11 +134,11 @@ async fn main() -> Result<()> {
         sources.push(format!("{name} (iceberg)"));
     }
 
-    let quack_token = extra.quack.token.clone().or_else(|| cfg.server.auth_token.clone());
-    let quack = Arc::new(quack::QuackServer::new(ctx.clone(), quack_token));
+    let quack = Arc::new(quack::QuackServer::new(ctx.clone(), authz.clone()));
 
     let state = Arc::new(server::AppState {
         quack,
+        authz: authz.clone(),
         ctx,
         agents: agents.clone(),
         hub,
@@ -146,7 +156,7 @@ async fn main() -> Result<()> {
         addr = %listener.local_addr()?,
         data_dir = %data_dir.display(),
         memory = state.memory.backend_name(),
-        auth = cfg.server.auth_token.is_some(),
+        auth = if authz.open { "open" } else { "enforced" },
         "enact-db listening"
     );
     axum::serve(listener, server::router(state))

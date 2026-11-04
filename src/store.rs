@@ -199,6 +199,18 @@ impl HubStore {
         Ok(out)
     }
 
+    pub async fn doc_exists(&self, doc_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query("SELECT 1 FROM crdt_updates WHERE doc_id = ?1 LIMIT 1", (doc_id,)).await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    pub async fn session_exists(&self, session: &str) -> Result<bool> {
+        let conn = self.conn.lock().await;
+        let mut rows = conn.query("SELECT 1 FROM transcripts WHERE session_id = ?1 LIMIT 1", (session,)).await?;
+        Ok(rows.next().await?.is_some())
+    }
+
     pub async fn doc_stats(&self) -> Result<Vec<DocStat>> {
         let conn = self.conn.lock().await;
         let mut rows = conn

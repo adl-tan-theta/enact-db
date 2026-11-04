@@ -3,7 +3,7 @@
 //! DuckDB clients attach enact-db like any Quack server:
 //!
 //! ```sql
-//! CREATE SECRET (TYPE quack, TOKEN 'secret');       -- if a token is configured
+//! CREATE SECRET (TYPE quack, TOKEN 'edb_...');      -- an enact-db API token, OIDC JWT or admin token
 //! ATTACH 'quack:localhost:9494' AS gw;
 //! FROM gw.customers;                                -- federated source (Postgres, Databricks, ...)
 //! FROM gw.system.agent_tool_calls;                  -- live agent audit
@@ -11,7 +11,9 @@
 //! ```
 //!
 //! What the server does with each request:
-//! * CONNECT: checks the token against `[quack] token` (or the server token)
+//! * CONNECT: authenticates the secret's token exactly like the HTTP API; every
+//!   later request on the connection is authorized as that principal: the
+//!   catalog only lists tables it may see and every query is checked per table
 //! * the two catalog queries a client sends at ATTACH (`duckdb_schemas()` /
 //!   `duckdb_tables()`) are answered from enact-db's catalog: `public` is exposed
 //!   as DuckDB's `main`, plus `system`
@@ -50,11 +52,12 @@ const CATALOG: &str = "gateway";
 
 pub struct QuackServer {
     ctx: SessionContext,
-    token: Option<String>,
+    authz: Arc<crate::authz::Authz>,
     conns: Mutex<HashMap<String, Arc<Mutex<Conn>>>>,
 }
 
 struct Conn {
+    caller: crate::authz::Caller,
     last_seen: Instant,
     query: Option<QueryState>,
 }
@@ -122,7 +125,7 @@ fn error_kind(e: &anyhow::Error) -> &'static str {
         "Parser"
     } else if s.contains("Schema error") || s.contains("Error during planning") {
         "Binder"
-    } else if s.contains("read-only") {
+    } else if s.contains("read-only") || s.contains("permission denied") || s.contains("Authentication failed") {
         "Permission"
     } else {
         "Invalid Input"
@@ -130,8 +133,8 @@ fn error_kind(e: &anyhow::Error) -> &'static str {
 }
 
 impl QuackServer {
-    pub fn new(ctx: SessionContext, token: Option<String>) -> Self {
-        Self { ctx, token, conns: Mutex::new(HashMap::new()) }
+    pub fn new(ctx: SessionContext, authz: Arc<crate::authz::Authz>) -> Self {
+        Self { ctx, authz, conns: Mutex::new(HashMap::new()) }
     }
 
     /// Handle one `POST /quack` body; always returns a Quack message.
@@ -156,11 +159,13 @@ impl QuackServer {
                     wire::QUACK_VERSION
                 ));
             }
-            if let Some(t) = &self.token {
-                if !constant_time_eq(auth.as_bytes(), t.as_bytes()) {
-                    return Err(anyhow!("Authentication failed"));
-                }
-            }
+            // The quack secret's TOKEN is any enact-db credential: API token, OIDC JWT
+            // or the break-glass admin token.
+            let caller = self
+                .authz
+                .authenticate(Some(auth.as_str()), Some(format!("duckdb/{client_version} (quack)")), "quack")
+                .await
+                .map_err(|d| anyhow!("Authentication failed: {d}"))?;
             let id = new_connection_id();
             let mut conns = self.conns.lock().await;
             let now = Instant::now();
@@ -175,8 +180,8 @@ impl QuackServer {
             for k in stale {
                 conns.remove(&k);
             }
-            conns.insert(id.clone(), Arc::new(Mutex::new(Conn { last_seen: now, query: None })));
-            tracing::info!(connection = %id, client = %client_version, "quack client connected");
+            tracing::info!(connection = %id, client = %client_version, principal = %caller.principal, "quack client connected");
+            conns.insert(id.clone(), Arc::new(Mutex::new(Conn { caller, last_seen: now, query: None })));
             return Ok(wire::connection_response(&id, heartbeat.max(1)));
         }
 
@@ -207,7 +212,8 @@ impl QuackServer {
             Request::SendData => Err(anyhow!("enact-db's Quack endpoint is read-only")),
             Request::Prepare { sql, uuid, inline_rows } => {
                 conn.query = None; // a new query supersedes the previous one
-                let (schema, stream) = self.run(&sql).await?;
+                let caller = conn.caller.clone();
+                let (schema, stream) = self.run(&sql, &caller).await?;
                 let types = duck_types(&schema);
                 let mut q = QueryState {
                     uuid,
@@ -269,30 +275,31 @@ impl QuackServer {
     }
 
     /// Execute SQL from a client: catalog emulation, scan translation, or passthrough.
-    async fn run(&self, sql: &str) -> Result<(SchemaRef, Option<SendableRecordBatchStream>)> {
+    async fn run(&self, sql: &str, caller: &crate::authz::Caller) -> Result<(SchemaRef, Option<SendableRecordBatchStream>)> {
         let lower = sql.to_ascii_lowercase();
         if lower.contains("from duckdb_schemas()") {
-            let b = self.schema_rows()?;
+            let b = self.schema_rows(caller).await?;
             return Ok((b.schema(), Some(one_batch_stream(b))));
         }
         if lower.contains("from duckdb_tables()") {
-            let b = self.table_rows().await?;
+            let b = self.table_rows(caller).await?;
             return Ok((b.schema(), Some(one_batch_stream(b))));
         }
         let translated = self.translate(sql).await;
         tracing::debug!(sql, translated = %translated, "quack query");
-        let opts = datafusion::execution::context::SQLOptions::new()
-            .with_allow_ddl(false)
-            .with_allow_dml(false)
-            .with_allow_statements(false);
-        let df = self.ctx.sql_with_options(&translated, opts).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("DDL") || msg.contains("DML") || msg.contains("Statement not supported") {
-                anyhow!("enact-db's Quack endpoint is read-only: {msg}")
-            } else {
-                anyhow!(msg)
-            }
-        })?;
+        let plan = crate::server::authorized_plan(&self.ctx, &self.authz, caller, &translated, false)
+            .await
+            .map_err(|e| {
+                let msg = e.1;
+                if msg.contains("DDL") || msg.contains("DML") || msg.contains("Statement not supported") {
+                    anyhow!("enact-db's Quack endpoint is read-only: {msg}")
+                } else if msg.contains(" lacks '") {
+                    anyhow!("permission denied: {msg}")
+                } else {
+                    anyhow!(msg)
+                }
+            })?;
+        let df = self.ctx.execute_logical_plan(plan).await?;
         let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
         let stream = df.execute_stream().await?;
         Ok((schema, Some(stream)))
@@ -320,8 +327,33 @@ impl QuackServer {
         out
     }
 
-    fn schema_rows(&self) -> Result<RecordBatch> {
-        let schemas = self.quack_schemas();
+    /// Schemas holding at least one table the caller may see.
+    async fn visible_schemas(&self, caller: &crate::authz::Caller) -> Vec<(QSchema, Vec<(String, SchemaRef)>)> {
+        let mut out = vec![];
+        for q in self.quack_schemas() {
+            let Some(s) = self.ctx.catalog(&q.catalog).and_then(|c| c.schema(&q.schema)) else { continue };
+            let mut names = s.table_names();
+            names.sort();
+            let mut tables = vec![];
+            for name in names {
+                if !self.authz.visible(caller, &crate::authz::table_resource(&q.catalog, &q.schema, &name)) {
+                    continue;
+                }
+                match s.table(&name).await {
+                    Ok(Some(t)) => tables.push((name, t.schema())),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(table = %name, error = %e, "skipping table in quack catalog"),
+                }
+            }
+            if !tables.is_empty() || q.oid == 1 {
+                out.push((q, tables));
+            }
+        }
+        out
+    }
+
+    async fn schema_rows(&self, caller: &crate::authz::Caller) -> Result<RecordBatch> {
+        let schemas: Vec<QSchema> = self.visible_schemas(caller).await.into_iter().map(|(q, _)| q).collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new("oid", DataType::Int64, false),
             Field::new("database_name", DataType::Utf8, false),
@@ -346,21 +378,12 @@ impl QuackServer {
         )?)
     }
 
-    async fn table_rows(&self) -> Result<RecordBatch> {
+    async fn table_rows(&self, caller: &crate::authz::Caller) -> Result<RecordBatch> {
         let (mut oids, mut sqls) = (vec![], vec![]);
-        for q in self.quack_schemas() {
-            let Some(s) = self.ctx.catalog(&q.catalog).and_then(|c| c.schema(&q.schema)) else { continue };
-            let mut names = s.table_names();
-            names.sort();
-            for name in names {
-                match s.table(&name).await {
-                    Ok(Some(t)) => {
-                        oids.push(q.oid);
-                        sqls.push(vector::create_table_sql(&name, &t.schema()));
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(table = %name, error = %e, "skipping table in quack catalog"),
-                }
+        for (q, tables) in self.visible_schemas(caller).await {
+            for (name, schema) in tables {
+                oids.push(q.oid);
+                sqls.push(vector::create_table_sql(&name, &schema));
             }
         }
         let schema = Arc::new(Schema::new(vec![
@@ -582,12 +605,6 @@ fn new_connection_id() -> String {
     out
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 #[cfg(test)]
 mod tests {

@@ -15,13 +15,16 @@ memory, transcripts, and enterprise data behind a single endpoint.
 │  presence, fan-out,   fs + kv + tool_calls   pgvector |       (cursor per sink) ──► │
 │  persisted log        (agentfs-compatible)   LanceDB                       Postgres │
 │                                                                                     │
-│  DataFusion federation: Postgres · Snowflake (ADBC) · Azure Blob Parquet/CSV/JSON · │
-│  local files · gateway.system.* live tables (audit, kv, docs, memory, transcripts)  │
+│  DataFusion federation: Postgres · Databricks · Snowflake (ADBC) · Iceberg REST     │
+│  (Lakekeeper/Polaris/Unity) · Azure Blob/S3 files · system.* live tables · Quack    │
+│                                                                                     │
+│  Permissions (Lakekeeper model): users/agents/roles, grants on a resource tree,     │
+│  OIDC + API tokens, admission gates, ownership-on-create, versioned audit log       │
 │                                                                                     │
 │  Blob tier (object_store: Azure / file://): agent sandbox push/pull + artifacts     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
         local:  data/hub.db (Turso) · data/agents/*.db (AgentFS) · DuckDB · LanceDB
-        cloud:  Postgres (memory, transcripts) · Azure Blob · Snowflake/Databricks
+        cloud:  Postgres (memory, transcripts) · Azure Blob · Iceberg · Snowflake/Databricks
 ```
 
 ## Why this shape
@@ -40,7 +43,7 @@ memory, transcripts, and enterprise data behind a single endpoint.
 ## Build
 
 ```bash
-cargo build --release                                  # azure + postgres (default)
+cargo build --release                                  # azure + postgres + iceberg (default)
 cargo build --release --features duckdb                # + DuckDB transcript sink
 cargo build --release --features lancedb               # + LanceDB memory backend
 cargo build --release --features full                  # everything except snowflake
@@ -68,7 +71,7 @@ managed cloud Postgres.
 ```bash
 ./enact-db                                   # local only, 127.0.0.1:9494, ./data
 ./enact-db --config enact-db.toml
-ENACT_DB_TOKEN=secret ./enact-db --listen 0.0.0.0:9494
+ENACT_DB_TOKEN=secret ./enact-db --listen 0.0.0.0:9494   # non-loopback requires auth
 ./enact-db --config cloud.toml --pull-agent researcher   # cloud sandbox boot
 ```
 
@@ -77,13 +80,19 @@ editor with presence and a live agent-activity feed. Open it in two tabs and
 use "Ask an agent to write" to see a human and an agent co-editing. With auth
 enabled, add `?token=…` to the URL.
 
+Without an `[auth]` section the server runs in **open mode** (every request
+allowed, logged as a warning). It refuses to start in open mode on anything but
+a loopback address.
+
 See [`enact-db.example.toml`](enact-db.example.toml) for every option.
 
 ## API
 
-Callers identify themselves with `X-Agent-Id: <id>` (agents) or `X-Actor: <name>`
-(humans). With `auth_token` set, send `Authorization: Bearer <token>`. The token
-can also go in `?token=` for WebSockets, since browsers can't set WebSocket headers.
+Every request carries a credential: `Authorization: Bearer <token>` (an API
+token, an OIDC JWT, or the break-glass admin token), or `?token=` on
+WebSockets, since browsers can't set WebSocket headers. `X-Agent-Id: <id>` acts as
+that agent, which needs `assume` on `agent:<id>` unless the token *is* that agent.
+Each endpoint checks the privilege it needs (see [Permissions](#permissions)).
 
 ### Multiplayer documents (CRDT)
 
@@ -161,13 +170,16 @@ enact-db speaks Quack v3 at `POST /quack` on its main port, so any DuckDB can
 attach the whole gateway (federated sources plus live agent state) as a database:
 
 ```sql
-CREATE SECRET (TYPE quack, TOKEN 'duck-secret');   -- when a token is configured
+CREATE SECRET (TYPE quack, TOKEN 'edb_…');          -- any enact-db credential
 ATTACH 'quack:localhost:9494' AS gw;
 FROM gw.customers;                                 -- Postgres / Databricks / Snowflake / files
 SELECT agent_id, count(*) FROM gw.system.agent_tool_calls GROUP BY ALL;
 FROM quack_query('gw', 'SELECT ... any DataFusion SQL ...');
 ```
 
+* The secret's token is authenticated like any API call. The catalog the client
+  sees lists only tables that principal may see, and every scan or
+  `quack_query` is checked per table.
 * At ATTACH, the client's catalog queries (`duckdb_schemas()`/`duckdb_tables()`)
   are answered from enact-db's catalog: `public` appears as `main`, next to `system`.
 * Scans arrive as `SELECT #1, #3 FROM main.t` and run on DataFusion. Results
@@ -190,10 +202,113 @@ filters are pushed down to the warehouse (filters are re-checked locally). Auth
 is a PAT/Entra token or OAuth M2M with a service principal. The Databricks token
 is never sent to the presigned storage links; only the headers Databricks returns are.
 
+### Apache Iceberg (Lakekeeper, Polaris, Unity Catalog, …)
+
+Each `[[iceberg]]` entry mounts an Iceberg REST catalog as a DataFusion catalog:
+
+```toml
+[[iceberg]]
+name = "lake"                                  # -> lake.<namespace>.<table>
+uri = "http://lakekeeper:8181/catalog"
+warehouse = "prod"
+credential_env = "LAKE_CLIENT_CREDENTIALS"     # "client_id:secret" (OAuth2), or token_env = "…"
+scope = "lakekeeper"
+```
+
+```sql
+SELECT c.name, sum(o.amount) FROM lake.sales.orders o JOIN customers c ON c.id = o.customer_id GROUP BY 1;
+```
+
+* Uses the `iceberg` and `iceberg-catalog-rest` crates. Storage goes through
+  enact-db's own `object_store` bridge (local, S3, ADLS/Blob), and per-table
+  credentials vended by the catalog are honoured.
+* Every query reloads table metadata, so a new snapshot is visible immediately.
+  Projections and typed filters are pushed down (partition and file pruning),
+  and DataFusion re-checks the filters.
+* Nested namespaces appear as `a.b`. Over Quack the catalog shows up as nested
+  schemas (`gw.lake.sales.orders`). Tables are permission-checked as
+  `table:lake/<namespace>/<table>`.
+
 ### Blob artifacts
 
 `PUT/GET /v1/blob/{path}` and `GET /v1/blob` store files under
 `<blob url>/artifacts/…`, so sandboxed agents never hold cloud credentials.
+
+## Permissions
+
+The model follows Lakekeeper's (Apache-2.0) OpenFGA authorization model; the
+implementation is enact-db's own (`src/authz/`).
+
+**Principals:** `user:<id>`, `agent:<id>`, `role:<id>`. Roles contain users,
+agents or other roles, transitively.
+
+**Resources** form a tree. A grant applies to the node and everything below it:
+
+```text
+server ─┬─ catalog:<c> ── schema:<c>/<s> ── table:<c>/<s>/<t>      (gateway, iceberg, …)
+        ├─ docs ── doc:<id>                ├─ agents ── agent:<id>
+        ├─ memories ── memory:<ns>         ├─ transcripts ── transcript:<session>
+        ├─ blob ── blob:<dir> ── blob:<dir>/<file>
+        └─ roles ── role:<id>
+```
+
+**Privileges:**
+* `ownership` implies everything.
+* `modify ⇒ write_data ⇒ select ⇒ describe`, and `create ⇒ describe`.
+* `manage_grants` lets you grant and revoke anything on the subtree.
+* `pass_grants` lets you re-grant privileges you already hold (but not ownership or grant rights).
+* `assume` on `agent:<id>` lets a human or service act as that agent. Audit
+  events record both identities.
+
+**What each operation needs:**
+
+| Operation | Needs |
+|---|---|
+| SQL / Quack query | `select` on every table the plan touches (subqueries included); `information_schema` needs `describe` on the catalog; DDL/DML need `ownership` on `server` |
+| Read / edit a doc, WebSocket | `select` / `write_data` on `doc:<id>`. Peers without `write_data` connect read-only, and their updates are dropped |
+| Agent sandbox fs/kv/tools | `select` / `write_data` on `agent:<id>` (an agent always owns its own sandbox); push/pull needs `modify` |
+| Memory, transcripts, blob | `select` / `write_data` on `memory:<ns>`, `transcript:<session>`, `blob:<path>` |
+| Create a doc / memory namespace / transcript session / sandbox | `create` on the container. The creator becomes the owner |
+| Listings (`/v1/info`, docs, agents, Quack catalog) | show only what you can `describe` or hold a grant below |
+
+**Authentication:**
+* **API tokens** (`edb_…`, stored as SHA-256 hashes, revocable).
+* **OIDC JWTs** (Entra ID, Okta, Keycloak…), validated via JWKS. **Admission gates**
+  (`required_claims`) reject tokens and name the failing claim. Values in the
+  roles claim become provider-managed `role:oidc:<name>` roles, which can't be edited locally.
+* A **break-glass** `admin_token`, which bypasses checks but is always audited.
+
+```toml
+[auth]
+admin_token = "…"                                # break-glass (or ENACT_DB_TOKEN)
+[auth.oidc]
+issuer = "https://login.microsoftonline.com/<tenant>/v2.0"
+audience = ["api://enact-db"]
+agent_claim = { claim = "idtyp", value = "app" }    # app-only tokens are agents
+required_claims = { tid = "<tenant-id>" }
+[[auth.roles]]
+id = "analysts"
+members = ["user:alice"]
+[[auth.grants]]
+principal = "role:oidc:member"
+resource = "docs"
+privilege = "create"
+```
+
+**API** (`/v1/authz/…`):
+* `whoami`
+* `check`: batch check, reporting which grant determined each result
+* `grants`: list, also as a subtree; grant; revoke
+* `roles` and `roles/{id}/members`
+* `tokens`: issue for yourself, for an agent you may `assume`, or for anyone as an admin; list; revoke
+* `audit`
+
+Grants and the audit log are also SQL tables: `system.grants` and `system.audit_log`.
+
+**Audit log** (`version = 1`): one entry per decision (allow and deny) and per
+permission change. Each entry records the principal, `acting_for`, source
+(http/ws/quack), action, resource, decision, `determined_by` (the exact grant),
+reason, user agent and detail.
 
 ## Tests
 
@@ -217,6 +332,15 @@ node tests/browser.mjs http://127.0.0.1:9494 # two Chromium users + an HTTP agen
   enforcement and disconnect.
 * `tests/databricks.rs` runs against a mock of the Statement Execution API
   (polling, multi-chunk Arrow, pushdown SQL, token isolation, error reporting).
+* `tests/authz.rs` acts out a multiplayer permissions scenario: OIDC admission
+  gate, provider roles, API tokens, schema-level grants via roles, subquery
+  smuggling blocked, doc ownership on create, sharing, a read-only WebSocket
+  peer whose edits are dropped, `pass_grants` limits, `assume` with
+  dual-identity audit, batch check with `determined_by`, filtered listings,
+  token revocation, the Quack catalog filtered per principal, and the audit log over SQL.
+* `tests/iceberg.rs` writes a real Iceberg table with iceberg-rust and serves it
+  through a spec-shaped REST catalog with a bearer token. It covers pushdown,
+  `count(*)`, a join with a CSV source, a new snapshot appearing mid-test, and Quack.
 * `tests/browser.mjs` runs the built-in page in Chromium: two humans type and
   an agent edits over HTTP, then it checks that all copies match, that presence
   shows `alice | bob | planner (agent)`, and that the SQL-driven activity feed updates.

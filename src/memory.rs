@@ -250,11 +250,11 @@ impl MemoryStore {
 mod lance {
     use super::{MemoryHit, MemoryQuery, MemoryRecord};
     use anyhow::{anyhow, Result};
-    use arrow_array_lance::types::Float32Type;
-    use arrow_array_lance::{
+    use arrow_array58::types::Float32Type;
+    use arrow_array58::{
         Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
     };
-    use arrow_schema_lance::{DataType, Field, Schema, SchemaRef};
+    use arrow_schema58::{DataType, Field, Schema, SchemaRef};
     use futures::TryStreamExt;
     use lancedb::query::{ExecutableQuery, QueryBase};
     use std::sync::Arc;

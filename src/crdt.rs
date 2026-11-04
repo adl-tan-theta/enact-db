@@ -68,7 +68,9 @@ impl Room {
 
     /// Handle one binary y-protocol frame from a peer. Returns direct replies
     /// for that peer; doc/awareness changes are broadcast by the observers.
-    pub fn handle(&self, origin: &str, data: &[u8]) -> Result<Handled> {
+    /// `can_write = false` makes the peer read-only: document updates it sends are
+    /// dropped (it still syncs, receives updates and shares presence).
+    pub fn handle(&self, origin: &str, data: &[u8], can_write: bool) -> Result<Handled> {
         let mut replies = vec![];
         let mut aw_clients = vec![];
         let mut decoder = DecoderV1::new(Cursor::new(data));
@@ -80,6 +82,9 @@ impl Room {
                 Message::Sync(SyncMessage::SyncStep1(sv)) => {
                     let update = aw.doc().transact().encode_state_as_update_v1(&sv);
                     replies.push(Message::Sync(SyncMessage::SyncStep2(update)).encode_v1());
+                }
+                Message::Sync(SyncMessage::SyncStep2(_)) | Message::Sync(SyncMessage::Update(_)) if !can_write => {
+                    tracing::debug!(peer = origin, doc = %self.id, "dropped update from read-only peer");
                 }
                 Message::Sync(SyncMessage::SyncStep2(bytes)) | Message::Sync(SyncMessage::Update(bytes)) => {
                     let update = Update::decode_v1(&bytes).map_err(|e| anyhow!("bad update: {e}"))?;
@@ -164,6 +169,13 @@ pub fn valid_doc_id(id: &str) -> bool {
 impl Hub {
     pub fn new(store: Arc<HubStore>) -> Self {
         Self { store, rooms: tokio::sync::Mutex::new(HashMap::new()) }
+    }
+
+    pub async fn exists(&self, id: &str) -> Result<bool> {
+        if self.rooms.lock().await.contains_key(id) {
+            return Ok(true);
+        }
+        self.store.doc_exists(id).await
     }
 
     pub async fn loaded_rooms(&self) -> Vec<Arc<Room>> {
