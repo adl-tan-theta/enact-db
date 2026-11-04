@@ -11,6 +11,7 @@ mod blob;
 mod catalog;
 mod config;
 mod crdt;
+mod databricks;
 mod memory;
 #[cfg(feature = "postgres")]
 mod pg;

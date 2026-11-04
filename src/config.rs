@@ -94,6 +94,32 @@ pub enum SourceConfig {
     Json { name: String, location: String, #[serde(default)] azure: Option<AzureConfig> },
     /// A Postgres table (read via datafusion-table-providers, filters/limits pushed down).
     Postgres { name: String, connection: String, table: String },
+    /// A Databricks table or query via the SQL Statement Execution API (Arrow over REST).
+    Databricks {
+        name: String,
+        /// Workspace URL, e.g. "https://adb-1234567890.12.azuredatabricks.net"
+        host: String,
+        /// SQL warehouse id (from the warehouse's connection details).
+        warehouse_id: String,
+        /// "catalog.schema.table" (exactly one of `table` / `query`).
+        #[serde(default)]
+        table: Option<String>,
+        /// Arbitrary SELECT executed on the warehouse.
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        catalog: Option<String>,
+        #[serde(default)]
+        schema: Option<String>,
+        /// Env var holding a personal access token (or Entra ID token on Azure).
+        #[serde(default)]
+        token_env: Option<String>,
+        /// OAuth M2M service principal: client id + env var holding the secret.
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_secret_env: Option<String>,
+    },
     /// A Snowflake table through an ADBC driver (build with `--features snowflake`).
     Snowflake {
         name: String,
@@ -112,6 +138,7 @@ impl SourceConfig {
             | SourceConfig::Csv { name, .. }
             | SourceConfig::Json { name, .. }
             | SourceConfig::Postgres { name, .. }
+            | SourceConfig::Databricks { name, .. }
             | SourceConfig::Snowflake { name, .. } => name,
         }
     }

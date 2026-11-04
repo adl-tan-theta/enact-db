@@ -47,6 +47,20 @@ async fn register_source(ctx: &SessionContext, src: &SourceConfig) -> Result<()>
         SourceConfig::Postgres { name, connection, table } => {
             register_postgres(ctx, name, connection, table).await?;
         }
+        SourceConfig::Databricks {
+            name, host, warehouse_id, table, query, catalog, schema, token_env, client_id, client_secret_env,
+        } => {
+            use crate::databricks::{Auth, DatabricksClient, DatabricksTable};
+            let env = |v: &str| std::env::var(v).with_context(|| format!("env var {v} not set"));
+            let auth = match (token_env, client_id, client_secret_env) {
+                (Some(t), None, None) => Auth::Token(env(t)?),
+                (None, Some(id), Some(sec)) => Auth::OAuth { client_id: id.clone(), client_secret: env(sec)? },
+                _ => return Err(anyhow!("databricks: set either token_env, or client_id + client_secret_env")),
+            };
+            let client = Arc::new(DatabricksClient::new(host, warehouse_id, catalog.clone(), schema.clone(), auth)?);
+            let t = DatabricksTable::try_new(client, table.as_deref(), query.as_deref()).await?;
+            ctx.register_table(name, Arc::new(t))?;
+        }
         SourceConfig::Snowflake { name, driver, uri, table } => {
             register_snowflake(ctx, name, driver, uri, table).await?;
         }
