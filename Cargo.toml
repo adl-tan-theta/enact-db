@@ -1,0 +1,65 @@
+[package]
+name = "agentgate"
+version = "0.1.0"
+edition = "2021"
+description = "Single-binary data gateway: DataFusion federation + AgentFS (Turso) agent state over HTTP"
+
+[features]
+default = ["azure", "postgres"]
+azure = ["object_store/azure"]
+postgres = ["datafusion-table-providers/postgres", "dep:tokio-postgres", "dep:postgres-native-tls", "dep:native-tls"]
+duckdb = ["dep:duckdb"]
+lancedb = ["dep:lancedb", "dep:arrow-array-lance", "dep:arrow-schema-lance"]
+full = ["azure", "postgres", "duckdb", "lancedb"]
+# Snowflake via ADBC (driver shared library loaded at runtime)
+snowflake = ["datafusion-table-providers/adbc", "dep:adbc_core", "dep:adbc_driver_manager"]
+
+[dependencies]
+tokio-postgres = { version = "0.7", optional = true, features = ["with-serde_json-1"] }
+postgres-native-tls = { version = "0.5", optional = true }
+native-tls = { version = "0.2", optional = true }
+duckdb = { version = "1.20000", optional = true, features = ["bundled", "json"] }
+lancedb = { version = "0.41", optional = true, default-features = false }
+arrow-array-lance = { package = "arrow-array", version = "58", optional = true }
+arrow-schema-lance = { package = "arrow-schema", version = "58", optional = true }
+base64 = "0.22"
+adbc_core = { version = "0.25", optional = true }
+adbc_driver_manager = { version = "0.25", optional = true }
+tokio = { version = "1", features = ["full"] }
+datafusion = "55.2"
+datafusion-table-providers = { version = "0.15.1", default-features = false, optional = false }
+object_store = { version = "0.13", default-features = false }
+agentfs-sdk = "0.6.4"
+axum = { version = "0.8", features = ["ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+bytes = "1"
+async-trait = "0.1"
+yrs = { version = "0.27", features = ["sync"] }
+turso = "=0.4.4"
+tokio-stream = "0.1.19"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.29"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Keep debug builds small: DataFusion x2 + Lance + DuckDB with full debuginfo exceeds 25 GB.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

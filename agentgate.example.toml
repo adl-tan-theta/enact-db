@@ -1,0 +1,74 @@
+# agentgate example configuration. Every section is optional; with no config at all
+# the binary runs fully local (Turso memory, CRDT hub, AgentFS sandboxes).
+
+[server]
+listen = "127.0.0.1:9494"
+data_dir = "./data"
+# auth_token = "change-me"        # or AGENTGATE_TOKEN env / --token
+allow_sql_writes = false          # reject DDL/DML through /v1/query
+max_rows = 10000
+
+[crdt]
+compact_after = 500               # fold a document's update log into a snapshot every N updates
+
+# ---------------------------------------------------------------------------
+# Memory: "turso" (local, default) | "postgres" (pgvector) | "lancedb" (--features lancedb)
+# ---------------------------------------------------------------------------
+[memory]
+backend = "turso"
+# backend = "postgres"
+# postgres = "host=myserver.postgres.database.azure.com user=app password=... dbname=agents sslmode=require"
+# postgres_table = "agent_memories"
+# backend = "lancedb"
+# lancedb_uri = "./data/lancedb"   # or az://container/lancedb
+# dimensions = 1536
+
+# ---------------------------------------------------------------------------
+# Transcripts: always written to the local outbox, then exported to each sink.
+# ---------------------------------------------------------------------------
+[transcripts]
+interval_ms = 1000
+
+# [[transcripts.sinks]]
+# kind = "duckdb"                  # needs --features duckdb
+# path = "./data/transcripts.duckdb"
+
+# [[transcripts.sinks]]
+# kind = "postgres"
+# connection = "host=... user=... password=... dbname=... sslmode=require"
+# table = "session_transcripts"
+
+# ---------------------------------------------------------------------------
+# Blob tier: agent sandbox sync + artifacts. Azure creds come from AZURE_* env vars
+# (AZURE_STORAGE_ACCOUNT_NAME, AZURE_STORAGE_ACCOUNT_KEY, or managed identity).
+# ---------------------------------------------------------------------------
+# [blob]
+# url = "az://agent-sandboxes/prod"
+# push_interval_secs = 60
+
+# ---------------------------------------------------------------------------
+# Federated sources (each becomes a SQL table in gateway.public)
+# ---------------------------------------------------------------------------
+# [[sources]]
+# kind = "postgres"
+# name = "customers"
+# connection = "host=localhost user=app password=secret dbname=crm sslmode=disable"
+# table = "public.customers"
+
+# [[sources]]
+# kind = "parquet"
+# name = "metrics_history"
+# location = "az://archive/metrics/"
+# azure = { account = "mystorageacct", access_key_env = "AZURE_STORAGE_ACCOUNT_KEY" }
+
+# [[sources]]
+# kind = "csv"
+# name = "regions"
+# location = "./examples/regions.csv"
+
+# [[sources]]
+# kind = "snowflake"               # needs --features snowflake + the ADBC Snowflake driver
+# name = "orders"
+# driver = "/opt/adbc/libadbc_driver_snowflake.so"
+# uri = "user:password@account/DB/SCHEMA?warehouse=WH"
+# table = "ORDERS"

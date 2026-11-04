@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentgate workspace</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e2dd;
+    --accent: #2f6fde; --ok: #1f8a4c; --err: #c23b22;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a9a93; --line: #34342f;
+            --accent: #6d9eff; --ok: #4cc27f; --err: #ff7a62; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+           padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; }
+  header label { color: var(--muted); font-size: 12px; display: flex; gap: 6px; align-items: center; }
+  input, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; }
+  .status { font-size: 12px; color: var(--muted); }
+  .status.on { color: var(--ok); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-width: 0; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  textarea { width: 100%; min-height: 52vh; resize: vertical; border: 1px solid var(--line); border-radius: 8px;
+             padding: 12px; background: var(--bg); color: var(--ink);
+             font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .peers { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; min-height: 26px; }
+  .peer { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
+          border: 1px solid var(--line); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .feed { list-style: none; margin: 0; padding: 0; max-height: 46vh; overflow: auto; font-size: 12px; }
+  .feed li { padding: 6px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+  .feed .meta { color: var(--muted); }
+  .err { color: var(--err); }
+  .row { display: flex; gap: 6px; margin-top: 8px; }
+  .row input { flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agentgate</h1>
+  <label>doc <input id="doc" value="workspace" size="12"></label>
+  <label>name <input id="user" size="10"></label>
+  <button class="primary" id="join">Join</button>
+  <span id="status" class="status">disconnected</span>
+</header>
+<main>
+  <section>
+    <h2>Shared document · <span id="docname"></span></h2>
+    <div class="peers" id="peers"></div>
+    <textarea id="editor" placeholder="Type here. Humans and agents edit the same Yjs text 'content'." disabled></textarea>
+  </section>
+  <section>
+    <h2>Agent activity (SQL over system.agent_tool_calls)</h2>
+    <ul class="feed" id="feed"></ul>
+    <h2 style="margin-top:14px">Ask an agent to write</h2>
+    <div class="row">
+      <input id="agentText" placeholder="text an agent appends via HTTP">
+      <button id="agentGo">Send</button>
+    </div>
+  </section>
+</main>
+<script type="module">
+// Yjs + y-websocket are bundled into the binary (web/ -> src/web/yjs-bundle.js): no CDN needed.
+import { Y, WebsocketProvider } from "/static/yjs-bundle.js";
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const token = params.get("token") || "";
+const authHeaders = token ? { Authorization: "Bearer " + token } : {};
+const palette = ["#2f6fde", "#d0473a", "#1f8a4c", "#b26b00", "#7b49c8", "#008b8b"];
+$("user").value = params.get("user") || "human-" + Math.floor(Math.random() * 1000);
+if (params.get("doc")) $("doc").value = params.get("doc");
+
+let provider = null, ydoc = null;
+
+function join() {
+  if (provider) { provider.destroy(); ydoc.destroy(); }
+  const docName = $("doc").value.trim() || "workspace";
+  const user = $("user").value.trim() || "anonymous";
+  $("docname").textContent = docName;
+  ydoc = new Y.Doc();
+  const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  const q = { user };
+  if (token) q.token = token;
+  provider = new WebsocketProvider(wsBase, docName, ydoc, { params: q });
+  provider.awareness.setLocalStateField("user", {
+    name: user, kind: "human", color: palette[Math.abs(hash(user)) % palette.length],
+  });
+  provider.on("status", (e) => {
+    $("status").textContent = e.status;
+    $("status").className = "status" + (e.status === "connected" ? " on" : "");
+  });
+  provider.awareness.on("change", renderPeers);
+  bindTextarea(ydoc.getText("content"), $("editor"));
+  $("editor").disabled = false;
+  renderPeers();
+}
+
+function hash(s) { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return h; }
+
+function renderPeers() {
+  const el = $("peers"); el.textContent = "";
+  for (const [id, st] of provider.awareness.getStates()) {
+    const u = st.user || st.agent || {};
+    const name = u.name || ("client " + id);
+    const chip = document.createElement("span"); chip.className = "peer";
+    const dot = document.createElement("span"); dot.className = "dot";
+    dot.style.background = u.color || "#888";
+    chip.append(dot, document.createTextNode(name + (u.kind === "agent" ? " (agent)" : "") +
+      (id === provider.awareness.clientID ? " (you)" : "")));
+    el.append(chip);
+  }
+}
+
+// Minimal textarea <-> Y.Text binding: diff on input, apply remote deltas with cursor preservation.
+function bindTextarea(ytext, ta) {
+  ta.value = ytext.toString();
+  let last = ta.value;
+  ta.oninput = () => {
+    const now = ta.value;
+    let start = 0;
+    while (start < last.length && start < now.length && last[start] === now[start]) start++;
+    let endOld = last.length, endNew = now.length;
+    while (endOld > start && endNew > start && last[endOld - 1] === now[endNew - 1]) { endOld--; endNew--; }
+    ydoc.transact(() => {
+      if (endOld > start) ytext.delete(start, endOld - start);
+      if (endNew > start) ytext.insert(start, now.slice(start, endNew));
+    }, "local");
+    last = now;
+  };
+  ytext.observe((ev, tr) => {
+    if (tr.origin === "local") return;
+    let { selectionStart: s, selectionEnd: e } = ta;
+    let pos = 0;
+    for (const d of ev.delta) {
+      if (d.retain) pos += d.retain;
+      else if (d.insert) {
+        const n = d.insert.length;
+        if (pos <= s) s += n; if (pos <= e) e += n; pos += n;
+      } else if (d.delete) {
+        const n = d.delete;
+        if (pos < s) s -= Math.min(n, s - pos); if (pos < e) e -= Math.min(n, e - pos);
+      }
+    }
+    ta.value = ytext.toString(); last = ta.value;
+    if (document.activeElement === ta) ta.setSelectionRange(s, e);
+  });
+}
+
+async function refreshFeed() {
+  try {
+    const r = await fetch("/v1/query", {
+      method: "POST", headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ sql:
+        "SELECT agent_id, name, status, parameters, started_at FROM system.agent_tool_calls " +
+        "ORDER BY started_at DESC, id DESC LIMIT 25" }),
+    });
+    const j = await r.json();
+    const feed = $("feed"); feed.textContent = "";
+    if (!r.ok) { feed.innerHTML = `<li class="err"></li>`; feed.firstChild.textContent = j.error; return; }
+    for (const row of j.rows) {
+      const li = document.createElement("li");
+      const meta = document.createElement("div"); meta.className = "meta";
+      meta.textContent = `${row.agent_id} · ${new Date(row.started_at * 1000).toLocaleTimeString()} · ${row.status}`;
+      const body = document.createElement("div");
+      body.textContent = row.name + " " + (row.parameters || "");
+      li.append(meta, body); feed.append(li);
+    }
+    if (!j.rows.length) feed.innerHTML = '<li class="meta">No agent activity yet.</li>';
+  } catch (e) { /* server restarting */ }
+}
+
+$("agentGo").onclick = async () => {
+  const text = $("agentText").value; if (!text) return;
+  const doc = $("doc").value.trim() || "workspace";
+  await fetch(`/v1/docs/${encodeURIComponent(doc)}/presence`, {
+    method: "PUT", headers: { "content-type": "application/json", "x-agent-id": "demo-agent", ...authHeaders },
+    body: JSON.stringify({ state: { user: { name: "demo-agent", kind: "agent", color: "#7b49c8" } } }),
+  });
+  await fetch(`/v1/docs/${encodeURIComponent(doc)}/text/content`, {
+    method: "POST", headers: { "content-type": "application/json", "x-agent-id": "demo-agent", ...authHeaders },
+    body: JSON.stringify({ append: "\n[demo-agent] " + text }),
+  });
+  $("agentText").value = ""; refreshFeed();
+};
+
+$("join").onclick = join;
+join();
+refreshFeed();
+setInterval(refreshFeed, 3000);
+</script>
+</body>
+</html>
