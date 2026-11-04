@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>enact-db live workspace</title>
+<style>
+  :root {
+    --bg: #f6f6f3; --panel: #ffffff; --ink: #1c1c1a; --muted: #6b6b65; --line: #e2e1dc;
+    --accent: #2f6fde; --ok: #1f8a4c; --warn: #b26b00; --err: #c23b22; --soft: #f0efea;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --muted: #9a9a93; --line: #33332f;
+      --accent: #6d9eff; --ok: #4cc27f; --warn: #e3a33b; --err: #ff7a62; --soft: #262624;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 10px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  .brand { font-weight: 650; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .me { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.role-editor { color: var(--ok); border-color: currentColor; }
+  .badge.role-viewer { color: var(--warn); border-color: currentColor; }
+  .conn { width: 8px; height: 8px; border-radius: 50%; background: var(--err); display: inline-block; }
+  .conn.on { background: var(--ok); }
+  .peers { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+  .peer { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 3px; border-radius: 999px;
+          border: 1px solid var(--line); background: var(--panel); font-size: 12px; }
+  .avatar { width: 20px; height: 20px; border-radius: 50%; color: #fff; display: grid; place-items: center;
+            font-size: 11px; font-weight: 700; }
+  .peer .st { color: var(--muted); }
+  .peer.agent .avatar { border-radius: 6px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 14px; padding: 14px 16px; }
+  @media (max-width: 960px) { main { grid-template-columns: minmax(0, 1fr); } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  h2 { margin: 0 0 8px; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+       display: flex; align-items: center; gap: 8px; }
+  h2 .grow { flex: 1; }
+  button, input, select { font: inherit; color: inherit; }
+  button { background: var(--soft); border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
+  /* --- editor with remote cursors (mirror technique) --- */
+  .editor { position: relative; height: 56vh; min-height: 320px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); }
+  .editor textarea, .editor .mirror {
+    position: absolute; inset: 0; margin: 0; padding: 12px 14px; border: 0; width: 100%; height: 100%;
+    font: 14px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: break-word; overflow-y: auto; tab-size: 4;
+  }
+  .editor textarea { background: transparent; color: var(--ink); resize: none; outline: none; caret-color: var(--ink); z-index: 2; }
+  .editor .mirror { color: transparent; pointer-events: none; z-index: 1; scrollbar-width: none; }
+  .rc { position: relative; border-left: 2px solid var(--c); margin-left: -1px; }
+  .rc .flag { position: absolute; top: -1.15em; left: -2px; background: var(--c); color: #fff; font: 600 10px/1.4 ui-sans-serif, system-ui, sans-serif;
+              padding: 0 4px; border-radius: 3px 3px 3px 0; white-space: nowrap; }
+  /* --- board --- */
+  .tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .swatch { width: 20px; height: 20px; border-radius: 50%; border: 2px solid transparent; padding: 0; }
+  .swatch.on { border-color: var(--ink); }
+  .tools input[type=text] { width: 120px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); }
+  .board { width: 100%; aspect-ratio: 10 / 7; border: 1px solid var(--line); border-radius: 9px;
+           background-color: var(--bg); background-image: radial-gradient(var(--line) 1px, transparent 1px); background-size: 20px 20px;
+           touch-action: none; display: block; }
+  .board text { font: 600 15px ui-sans-serif, system-ui, sans-serif; fill: var(--ink); pointer-events: none; }
+  .board .note-text { font-weight: 500; fill: #3d3200; }
+  .board .ptr-label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #fff; }
+  /* --- chat & activity --- */
+  .bottom { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 14px; }
+  @media (max-width: 960px) { .bottom { grid-template-columns: minmax(0, 1fr); } }
+  .bottom section { padding: 12px; }
+  .msgs { list-style: none; margin: 0 0 8px; padding: 0; height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .msg { display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: start; }
+  .msg .who { font-weight: 600; font-size: 12px; }
+  .msg .txt { overflow-wrap: anywhere; }
+  .msg.agent .txt { color: var(--ink); }
+  .mention { color: var(--accent); font-weight: 600; }
+  .compose { display: flex; gap: 6px; }
+  .compose input { flex: 1; min-width: 0; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chips button { font-size: 12px; padding: 2px 8px; border-radius: 999px; }
+  .feed { list-style: none; margin: 0; padding: 0; height: 268px; overflow-y: auto; font-size: 12px; }
+  .feed li { padding: 6px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: auto 1fr auto; gap: 8px; }
+  .feed .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .feed code { font: 12px var(--mono); }
+  .empty { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">enact-db <small>live workspace · <span id="docname"></span></small></div>
+  <div class="me"><span class="conn" id="conn" title="connection"></span> <span id="me">connecting…</span> <span class="badge" id="role">…</span></div>
+  <div class="peers" id="peers"></div>
+</header>
+<main>
+  <section>
+    <h2>Document <span class="grow"></span><button id="undo" title="Undo your last change (only yours)">Undo</button><button id="redo">Redo</button></h2>
+    <div class="editor"><div class="mirror" id="mirror" aria-hidden="true"></div><textarea id="editor" spellcheck="false" placeholder="Start writing. Everyone (humans and agents) sees each keystroke live."></textarea></div>
+  </section>
+  <section>
+    <h2>Board <span class="grow"></span><button id="clearmine" title="Remove the shapes you drew">Clear mine</button></h2>
+    <div class="tools" id="tools">
+      <button data-tool="pen" class="on">Pen</button>
+      <button data-tool="rect">Box</button>
+      <button data-tool="ellipse">Ellipse</button>
+      <button data-tool="arrow">Arrow</button>
+      <button data-tool="note">Note</button>
+      <input type="text" id="notetext" value="Idea" aria-label="note text">
+      <span id="swatches"></span>
+    </div>
+    <svg class="board" id="board" viewBox="0 0 1000 700" role="img" aria-label="shared drawing board">
+      <g id="shapes"></g><g id="pointers"></g>
+    </svg>
+  </section>
+  <div class="bottom">
+    <section>
+      <h2>Chat <span class="grow"></span><span class="empty">agents answer @mentions</span></h2>
+      <ul class="msgs" id="msgs"></ul>
+      <form class="compose" id="compose"><input id="chatin" placeholder="Message, e.g. @scribe summarize" autocomplete="off"><button>Send</button></form>
+      <div class="chips" id="chips">
+        <button type="button">@scribe summarize</button>
+        <button type="button">@scribe write Decision: ship v1 in May</button>
+        <button type="button">@sketch box Risks</button>
+        <button type="button">@sketch circle Customers</button>
+        <button type="button">@sketch smile</button>
+      </div>
+    </section>
+    <section>
+      <h2>Agent activity <span class="grow"></span><span class="empty">SQL over system.agent_tool_calls</span></h2>
+      <ul class="feed" id="feed"><li class="empty">No agent activity yet.</li></ul>
+    </section>
+  </div>
+</main>
+<script type="module">
+import { Y, WebsocketProvider } from "/static/yjs-bundle.js";
+
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+const token = qs.get("token") || "";
+const docName = qs.get("doc") || "demo";
+const auth = token ? { Authorization: "Bearer " + token } : {};
+$("docname").textContent = docName;
+
+const api = async (method, path, body) => {
+  const r = await fetch(path, { method, headers: { "content-type": "application/json", ...auth }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || r.status), { status: r.status });
+  return j;
+};
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const palette = ["#2f6fde", "#1f8a4c", "#c2255c", "#0b7285", "#e67700", "#5f3dc4"];
+const hashColor = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return palette[Math.abs(h) % palette.length]; };
+
+// ---- identity & permissions ------------------------------------------------------
+let who;
+try { who = await api("GET", "/v1/authz/whoami"); }
+catch (e) { document.body.innerHTML = `<p style="padding:24px">Cannot authenticate (${esc(e.message)}). Open the link printed by <code>enact-db demo</code>.</p>`; throw e; }
+const myName = who.principal.split(":").slice(1).join(":");
+const myColor = hashColor(myName);
+const check = await api("POST", "/v1/authz/check", { checks: [{ resource: "doc:" + docName, privilege: "write_data" }] }).catch(() => ({ results: [{ allowed: false }] }));
+const canWrite = !!check.results[0].allowed;
+$("me").textContent = myName;
+$("role").textContent = canWrite ? "editor" : "read-only";
+$("role").className = "badge " + (canWrite ? "role-editor" : "role-viewer");
+
+// ---- CRDT document ---------------------------------------------------------------
+const ydoc = new Y.Doc();
+const ytext = ydoc.getText("doc");
+const shapes = ydoc.getArray("shapes");
+const chat = ydoc.getArray("chat");
+const wsBase = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+const provider = new WebsocketProvider(wsBase, docName, ydoc, { params: { token } });
+const aw = provider.awareness;
+aw.setLocalState({ user: { name: myName, color: myColor, kind: "human" }, status: "idle", cursor: null, pointer: null });
+let synced = false;
+provider.on("status", (e) => $("conn").classList.toggle("on", e.status === "connected"));
+provider.on("sync", (s) => { if (s) synced = true; });
+const undo = new Y.UndoManager([ytext, shapes], { trackedOrigins: new Set(["local"]) });
+$("undo").onclick = () => undo.undo();
+$("redo").onclick = () => undo.redo();
+
+let statusTimer;
+function setStatus(s, ms = 1500) {
+  aw.setLocalStateField("status", s);
+  clearTimeout(statusTimer);
+  if (s !== "idle") statusTimer = setTimeout(() => aw.setLocalStateField("status", "idle"), ms);
+}
+
+// ---- presence bar ------------------------------------------------------------------
+function peers() {
+  return [...aw.getStates().entries()].filter(([, s]) => s && s.user).map(([id, s]) => ({ id, ...s }));
+}
+function renderPeers() {
+  const el = $("peers"); el.textContent = "";
+  for (const p of peers().sort((a, b) => (a.user.kind + a.user.name).localeCompare(b.user.kind + b.user.name))) {
+    const chip = document.createElement("span");
+    chip.className = "peer " + (p.user.kind === "agent" ? "agent" : "human");
+    chip.dataset.name = p.user.name;
+    const av = document.createElement("span"); av.className = "avatar"; av.style.background = p.user.color;
+    av.textContent = p.user.name[0].toUpperCase();
+    const nm = document.createElement("span");
+    nm.textContent = p.user.name + (p.id === ydoc.clientID ? " (you)" : "") + (p.user.kind === "agent" ? " · agent" : "");
+    const st = document.createElement("span"); st.className = "st";
+    st.textContent = p.status && p.status !== "idle" && p.status !== "joined" ? p.status + "…" : "";
+    chip.append(av, nm, st); el.append(chip);
+  }
+}
+
+// ---- document editor with live remote cursors --------------------------------------
+const ta = $("editor"), mirror = $("mirror");
+ta.readOnly = !canWrite;
+ta.value = ytext.toString();
+let last = ta.value;
+function publishCursor() {
+  const pos = Y.createRelativePositionFromTypeIndex(ytext, ta.selectionStart);
+  aw.setLocalStateField("cursor", { rel: Y.relativePositionToJSON(pos), index: ta.selectionStart });
+}
+ta.addEventListener("input", () => {
+  if (!canWrite) { ta.value = last; return; }
+  const now = ta.value;
+  let s = 0;
+  while (s < last.length && s < now.length && last[s] === now[s]) s++;
+  let eo = last.length, en = now.length;
+  while (eo > s && en > s && last[eo - 1] === now[en - 1]) { eo--; en--; }
+  ydoc.transact(() => {
+    if (eo > s) ytext.delete(s, eo - s);
+    if (en > s) ytext.insert(s, now.slice(s, en));
+  }, "local");
+  last = now;
+  publishCursor(); setStatus("typing");
+});
+ta.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); e.shiftKey ? undo.redo() : undo.undo(); }
+});
+for (const ev of ["select", "keyup", "click", "focus"]) ta.addEventListener(ev, publishCursor);
+ta.addEventListener("scroll", () => { mirror.scrollTop = ta.scrollTop; });
+ytext.observe((ev, tr) => {
+  if (tr.origin === "local") { renderMirror(); return; }
+  let { selectionStart: s, selectionEnd: e } = ta, pos = 0;
+  for (const d of ev.delta) {
+    if (d.retain) pos += d.retain;
+    else if (d.insert) { const n = d.insert.length; if (pos <= s) s += n; if (pos <= e) e += n; pos += n; }
+    else if (d.delete) { const n = d.delete; if (pos < s) s -= Math.min(n, s - pos); if (pos < e) e -= Math.min(n, e - pos); }
+  }
+  ta.value = ytext.toString(); last = ta.value;
+  if (document.activeElement === ta) ta.setSelectionRange(s, e);
+  renderMirror();
+});
+function cursorIndex(c) {
+  if (!c) return null;
+  if (c.rel) {
+    try {
+      const abs = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(c.rel), ydoc);
+      if (abs) return abs.index;
+    } catch (_) { /* fall back to index */ }
+  }
+  return typeof c.index === "number" ? c.index : null;
+}
+function renderMirror() {
+  const text = ytext.toString();
+  const marks = peers().filter((p) => p.id !== ydoc.clientID && p.cursor)
+    .map((p) => ({ i: Math.max(0, Math.min(text.length, cursorIndex(p.cursor) ?? -1)), p }))
+    .filter((m) => m.i >= 0).sort((a, b) => a.i - b.i);
+  let html = "", at = 0;
+  for (const { i, p } of marks) {
+    html += esc(text.slice(at, i)) + `<span class="rc" style="--c:${esc(p.user.color)}"><span class="flag">${esc(p.user.name)}</span></span>`;
+    at = i;
+  }
+  mirror.innerHTML = html + esc(text.slice(at)) + "​";
+  mirror.scrollTop = ta.scrollTop;
+}
+
+// ---- board -----------------------------------------------------------------------
+const svg = $("board"), gShapes = $("shapes"), gPtr = $("pointers");
+const NS = "http://www.w3.org/2000/svg";
+let tool = "pen", color = myColor;
+const swatches = [myColor, "#1c1c1a", "#c23b22", "#1f8a4c", "#e67700", "#5f3dc4"];
+for (const c of [...new Set(swatches)]) {
+  const b = document.createElement("button"); b.className = "swatch" + (c === color ? " on" : "");
+  b.style.background = c; b.title = c; b.type = "button";
+  b.onclick = () => { color = c; document.querySelectorAll(".swatch").forEach((x) => x.classList.toggle("on", x === b)); };
+  $("swatches").append(b);
+}
+document.querySelectorAll("[data-tool]").forEach((b) => b.onclick = () => {
+  tool = b.dataset.tool; document.querySelectorAll("[data-tool]").forEach((x) => x.classList.toggle("on", x === b));
+});
+if (!canWrite) document.querySelectorAll("#tools button, #tools input, #clearmine, #undo, #redo").forEach((b) => b.disabled = true);
+
+function el(name, attrs, parent) {
+  const n = document.createElementNS(NS, name);
+  for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+  parent && parent.append(n);
+  return n;
+}
+function label(g, text, x, y, cls) {
+  if (!text) return;
+  const t = el("text", { x, y, "text-anchor": "middle", "dominant-baseline": "middle", class: cls || "" }, g);
+  t.textContent = text.length > 26 ? text.slice(0, 25) + "…" : text;
+}
+let renderQueued = false;
+function renderShapes() {
+  renderQueued = false;
+  gShapes.textContent = "";
+  shapes.forEach((m) => {
+    if (!(m instanceof Y.Map)) return;
+    const s = m.toJSON();
+    const g = el("g", { "data-author": s.author || "", "data-kind": s.kind || "", "data-label": s.label || "" }, gShapes);
+    el("title", {}, g).textContent = `${s.kind} by ${s.author}`;
+    const c = s.color || "#888";
+    const x = Math.min(s.x, s.x + s.w), y = Math.min(s.y, s.y + s.h), w = Math.abs(s.w || 0), h = Math.abs(s.h || 0);
+    if (s.kind === "rect") {
+      el("rect", { x, y, width: w, height: h, rx: 12, fill: c + "1f", stroke: c, "stroke-width": 2.5 }, g);
+      label(g, s.label, x + w / 2, y + h / 2);
+    } else if (s.kind === "ellipse") {
+      el("ellipse", { cx: x + w / 2, cy: y + h / 2, rx: w / 2, ry: h / 2, fill: c + "1f", stroke: c, "stroke-width": 2.5 }, g);
+      label(g, s.label, x + w / 2, y + h / 2);
+    } else if (s.kind === "note") {
+      el("rect", { x, y, width: w, height: h, rx: 4, fill: "#fff3bf", stroke: c, "stroke-width": 1.5 }, g);
+      label(g, s.label, x + w / 2, y + h / 2, "note-text");
+    } else if (s.kind === "arrow") {
+      el("line", { x1: s.x, y1: s.y, x2: s.x2, y2: s.y2, stroke: c, "stroke-width": 2.5, "stroke-linecap": "round" }, g);
+      const a = Math.atan2(s.y2 - s.y, s.x2 - s.x), L = 13;
+      const p = [[s.x2, s.y2], [s.x2 - L * Math.cos(a - 0.45), s.y2 - L * Math.sin(a - 0.45)], [s.x2 - L * Math.cos(a + 0.45), s.y2 - L * Math.sin(a + 0.45)]];
+      el("polygon", { points: p.map((q) => q.join(",")).join(" "), fill: c }, g);
+    } else if (s.kind === "pen") {
+      const pts = s.points || [];
+      if (pts.length >= 2) {
+        let d = `M${pts[0]},${pts[1]}`;
+        for (let i = 2; i + 1 < pts.length; i += 2) d += ` L${pts[i]},${pts[i + 1]}`;
+        el("path", { d, fill: "none", stroke: c, "stroke-width": 3, "stroke-linecap": "round", "stroke-linejoin": "round" }, g);
+      }
+    }
+  });
+}
+const queueShapes = () => { if (!renderQueued) { renderQueued = true; requestAnimationFrame(renderShapes); } };
+shapes.observeDeep(queueShapes);
+
+function renderPointers() {
+  gPtr.textContent = "";
+  for (const p of peers()) {
+    if (p.id === ydoc.clientID || !p.pointer) continue;
+    const { x, y } = p.pointer;
+    const g = el("g", { transform: `translate(${x},${y})`, "data-pointer": p.user.name }, gPtr);
+    el("path", { d: "M0,0 L0,18 L5,13 L9,22 L12,21 L8,12 L14,12 Z", fill: p.user.color, stroke: "#fff", "stroke-width": 1.2 }, g);
+    const w = 10 + p.user.name.length * 7;
+    el("rect", { x: 14, y: 18, width: w, height: 17, rx: 4, fill: p.user.color }, g);
+    el("text", { x: 14 + w / 2, y: 27, "text-anchor": "middle", "dominant-baseline": "middle", class: "ptr-label" }, g).textContent = p.user.name;
+  }
+}
+
+function boardPoint(e) {
+  const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+  const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+  return { x: Math.round(p.x), y: Math.round(p.y) };
+}
+let drawing = null, lastMove = 0;
+svg.addEventListener("pointerdown", (e) => {
+  if (!canWrite) return;
+  svg.setPointerCapture(e.pointerId);
+  const { x, y } = boardPoint(e);
+  const m = new Y.Map();
+  ydoc.transact(() => {
+    m.set("id", `${myName}-${Date.now()}`); m.set("kind", tool); m.set("color", color); m.set("author", myName);
+    m.set("x", x); m.set("y", y); m.set("w", tool === "note" ? 170 : 0); m.set("h", tool === "note" ? 70 : 0);
+    m.set("x2", x); m.set("y2", y); m.set("label", tool === "note" ? ($("notetext").value || "Note") : "");
+    const pts = new Y.Array(); if (tool === "pen") pts.push([x, y]); m.set("points", pts);
+    shapes.push([m]);
+  }, "local");
+  drawing = tool === "note" ? null : { m, x, y };
+  setStatus("drawing", 3000);
+});
+svg.addEventListener("pointermove", (e) => {
+  const { x, y } = boardPoint(e);
+  const now = performance.now();
+  if (now - lastMove > 30) { aw.setLocalStateField("pointer", { x, y }); lastMove = now; }
+  if (!drawing) return;
+  const { m } = drawing;
+  ydoc.transact(() => {
+    const k = m.get("kind");
+    if (k === "pen") m.get("points").push([x, y]);
+    else if (k === "arrow") { m.set("x2", x); m.set("y2", y); }
+    else { m.set("w", x - drawing.x); m.set("h", y - drawing.y); }
+  }, "local");
+});
+const endDraw = () => { drawing = null; undo.stopCapturing(); };
+svg.addEventListener("pointerup", endDraw);
+svg.addEventListener("pointercancel", endDraw);
+svg.addEventListener("pointerleave", () => aw.setLocalStateField("pointer", null));
+$("clearmine").onclick = () => ydoc.transact(() => {
+  for (let i = shapes.length - 1; i >= 0; i--) { const m = shapes.get(i); if (m instanceof Y.Map && m.get("author") === myName) shapes.delete(i, 1); }
+}, "local");
+
+// ---- chat --------------------------------------------------------------------------
+function renderChat() {
+  const ul = $("msgs"); const atBottom = ul.scrollTop + ul.clientHeight >= ul.scrollHeight - 30;
+  ul.textContent = "";
+  for (const m of chat.toArray()) {
+    const li = document.createElement("li"); li.className = "msg " + (m.kind === "agent" ? "agent" : "human");
+    const av = document.createElement("span"); av.className = "avatar"; av.style.background = m.color || "#888";
+    av.textContent = (m.author || "?")[0].toUpperCase(); if (m.kind === "agent") av.style.borderRadius = "6px";
+    const body = document.createElement("div");
+    const whoEl = document.createElement("div"); whoEl.className = "who";
+    whoEl.textContent = m.author + (m.kind === "agent" ? " · agent" : "") + " · " + new Date(m.ts).toLocaleTimeString();
+    const txt = document.createElement("div"); txt.className = "txt";
+    txt.innerHTML = esc(m.text).replace(/@(\w+)/g, '<span class="mention">@$1</span>');
+    body.append(whoEl, txt); li.append(av, body); ul.append(li);
+  }
+  if (atBottom) ul.scrollTop = ul.scrollHeight;
+}
+chat.observe(renderChat);
+$("chatin").disabled = !canWrite;
+$("compose").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("chatin").value.trim(); if (!text || !canWrite) return;
+  ydoc.transact(() => chat.push([{ id: `${myName}-${Date.now()}`, author: myName, kind: "human", color: myColor, text, ts: Date.now() }]), "chat");
+  api("POST", "/v1/transcripts", { session_id: docName, role: "user", content: text }).catch(() => {});
+  $("chatin").value = "";
+};
+$("chips").querySelectorAll("button").forEach((b) => b.onclick = () => { $("chatin").value = b.textContent; $("chatin").focus(); });
+
+// ---- agent activity (SQL over the live system table) -----------------------------
+async function refreshFeed() {
+  try {
+    const r = await api("POST", "/v1/query", { sql:
+      "SELECT agent_id, name, parameters, started_at FROM system.agent_tool_calls ORDER BY started_at DESC, id DESC LIMIT 20" });
+    const ul = $("feed"); ul.textContent = "";
+    if (!r.rows.length) { ul.innerHTML = '<li class="empty">No agent activity yet.</li>'; return; }
+    for (const row of r.rows) {
+      const li = document.createElement("li");
+      const a = document.createElement("strong"); a.textContent = row.agent_id; a.style.color = hashColor(row.agent_id);
+      const n = document.createElement("span"); const code = document.createElement("code"); code.textContent = row.name; n.append(code);
+      let p = {}; try { p = JSON.parse(row.parameters || "{}"); } catch (_) {}
+      if (p.label || p.requested_by) n.append(" " + [p.label && `“${p.label}”`, p.requested_by && `for ${p.requested_by}`].filter(Boolean).join(" "));
+      const t = document.createElement("span"); t.className = "t"; t.textContent = new Date(row.started_at * 1000).toLocaleTimeString();
+      li.append(a, n, t); ul.append(li);
+    }
+  } catch (e) {
+    $("feed").innerHTML = `<li class="empty">${esc(e.status === 403 ? "No permission to read agent activity." : "Activity unavailable.")}</li>`;
+  }
+}
+refreshFeed(); setInterval(refreshFeed, 2500);
+
+aw.on("change", () => { renderPeers(); renderMirror(); renderPointers(); });
+renderPeers(); renderMirror(); renderShapes(); renderChat();
+
+// Hooks for automated tests.
+window.demo = {
+  me: myName, canWrite, get synced() { return synced; },
+  text: () => ytext.toString(),
+  shapes: () => shapes.toArray().map((m) => (m instanceof Y.Map ? m.toJSON() : m)),
+  chat: () => chat.toArray(),
+  peers: () => peers().map((p) => ({ name: p.user.name, kind: p.user.kind, status: p.status, self: p.id === ydoc.clientID })),
+};
+</script>
+</body>
+</html>

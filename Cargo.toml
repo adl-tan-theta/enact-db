@@ -57,6 +57,7 @@ async-trait = "0.1"
 yrs = { version = "0.27", features = ["sync"] }
 turso = "=0.4.4"
 tokio-stream = "0.1.19"
+tokio-tungstenite = "0.29"
 
 [dev-dependencies]
 parquet58 = { package = "parquet", version = "58.4" }

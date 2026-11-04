@@ -141,6 +141,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/", get(|| async { Html(include_str!("web/index.html")) }))
+        .route("/demo", get(|| async { Html(include_str!("web/demo.html")) }))
         .route("/health", get(|| async { "ok" }))
         // DuckDB Quack protocol: `ATTACH 'quack:host:port' AS gw`. Auth is the token in the
         // CONNECT message (DuckDB's quack secret), so this sits outside the bearer middleware.

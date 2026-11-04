@@ -13,6 +13,7 @@ mod catalog;
 mod config;
 mod crdt;
 mod databricks;
+mod demo;
 #[cfg(feature = "iceberg")]
 mod iceberg;
 mod memory;
@@ -25,30 +26,48 @@ mod systables;
 mod transcripts;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "enact-db", version, about)]
-struct Args {
+#[command(name = "enact-db", version, about, args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run the server (default).
+    Serve(ServeArgs),
+    /// Run an agent that joins a shared document as a live CRDT peer.
+    Agent(demo::agent::AgentArgs),
+    /// One-command multiplayer demo: server + team + tokens + two agents.
+    Demo(demo::DemoArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct ServeArgs {
     /// Path to enact-db.toml
     #[arg(short, long, env = "ENACT_DB_CONFIG")]
-    config: Option<PathBuf>,
+    pub config: Option<PathBuf>,
     /// Override [server] listen address
     #[arg(long, env = "ENACT_DB_LISTEN")]
-    listen: Option<std::net::SocketAddr>,
+    pub listen: Option<std::net::SocketAddr>,
     /// Override [server] data_dir
     #[arg(long, env = "ENACT_DB_DATA_DIR")]
-    data_dir: Option<PathBuf>,
-    /// Override [server] auth_token
+    pub data_dir: Option<PathBuf>,
+    /// Override [server] auth_token (break-glass admin token)
     #[arg(long, env = "ENACT_DB_TOKEN")]
-    token: Option<String>,
+    pub token: Option<String>,
     /// Pull these agents from the blob tier before serving (cloud sandbox boot).
     #[arg(long = "pull-agent")]
-    pull_agents: Vec<String>,
+    pub pull_agents: Vec<String>,
 }
 
 /// Sections that live outside `config::Config` (kept in their own modules).
@@ -77,7 +96,17 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => serve(cli.serve, None).await,
+        Some(Cmd::Serve(a)) => serve(a, None).await,
+        Some(Cmd::Agent(a)) => demo::agent::run(a).await,
+        Some(Cmd::Demo(d)) => demo::run(d).await,
+    }
+}
+
+/// Run the server until Ctrl-C. `ready` receives the bound address once listening.
+pub async fn serve(args: ServeArgs, ready: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>) -> Result<()> {
     let mut cfg = config::Config::load(args.config.as_deref())?;
     let extra: Extra = match &args.config {
         Some(p) => toml::from_str(&std::fs::read_to_string(p)?).context("parsing config")?,
@@ -152,6 +181,9 @@ async fn main() -> Result<()> {
     });
 
     let listener = tokio::net::TcpListener::bind(cfg.server.listen).await?;
+    if let Some(r) = ready {
+        let _ = r.send(listener.local_addr()?);
+    }
     tracing::info!(
         addr = %listener.local_addr()?,
         data_dir = %data_dir.display(),

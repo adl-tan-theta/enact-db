@@ -27,6 +27,49 @@ memory, transcripts, and enterprise data behind a single endpoint.
         cloud:  Postgres (memory, transcripts) · Azure Blob · Iceberg · Snowflake/Databricks
 ```
 
+## Try it: humans and agents in one workspace
+
+```bash
+cargo run --release -- demo
+```
+
+`enact-db demo` starts the server and creates a team through the authz API:
+role `demo-team`, scoped grants, one token per participant. Then it launches
+two agents and prints a link for each person:
+
+| Participant | Kind | Can |
+|---|---|---|
+| alice, bob | humans (browser) | write, draw, chat |
+| carol | human (browser) | watch live, read-only |
+| scribe | agent | types notes and summaries into the document |
+| sketch | agent | draws a box for every `## section`, plus shapes on request |
+
+Open the links in separate windows. Everyone shares one Yjs document with:
+* text, showing live cursors for people and agents
+* a vector board where strokes and shapes stream in as they're drawn, with
+  remote pointers
+* chat, where `@scribe summarize`, `@scribe write …`, `@sketch box …`,
+  `@sketch circle …` and `@sketch smile` give agents instructions
+* per-user undo: your Undo only touches your own changes
+* a live activity feed (SQL over `system.agent_tool_calls`)
+
+The agents are real CRDT peers. They use the same WebSocket protocol, an
+API token, presence, and a sticky cursor that follows concurrent edits. Each
+reserves its own paragraph, so a person typing at the end is never interleaved.
+Every action lands in the agent's AgentFS tool log, the session transcript and
+the audit log. Run your own agents against any server with:
+
+```bash
+enact-db agent --server http://host:9494 --token edb_… --name scribe --persona scribe --doc demo
+```
+
+`node tests/demo.mjs target/debug/enact-db` drives the full scenario in Chromium:
+* two humans and both agents type, draw and chat concurrently
+* all three browsers and the server converge
+* the viewer can't edit (disabled UI, and a 403 from the API)
+* undo is per user
+* transcripts, tool calls and the audit log are complete
+
 ## Why this shape
 
 * **No file-lock fights.** Only the gateway opens SQLite/Turso files. Agents
