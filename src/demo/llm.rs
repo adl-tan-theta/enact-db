@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_MODEL: &str = "MiniMax-M3";
+/// Embedding model for agent memory (OpenRouter). Alternatives:
+/// `nvidia/nemotron-3.5-embed-8b:free`, `amazon/titan-embed-text-v1`.
+pub const DEFAULT_EMBED_MODEL: &str = "nvidia/nemotron-3.5-embed-1b:free";
 pub const DEFAULT_MAX_TOKENS: u32 = 100_000;
 
 #[derive(Clone)]
@@ -60,14 +63,12 @@ impl Llm {
         Some(Self { http, base: base.trim_end_matches('/').to_string(), key, model, max_tokens })
     }
 
-    pub async fn complete(&self, system: &str, user: &str) -> Result<Completion> {
+    /// Chat with a full message list (system, history turns, current request).
+    pub async fn chat(&self, messages: Vec<Value>) -> Result<Completion> {
         let started = Instant::now();
         let body = json!({
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": messages,
             "temperature": 0.4,
             "max_tokens": self.max_tokens,
         });
@@ -97,6 +98,80 @@ impl Llm {
             .ok_or_else(|| anyhow!("LLM response has no choices[0].message.content"))?
             .to_string();
         Ok(Completion { text, usage: v.get("usage").cloned().unwrap_or(Value::Null), latency_ms: started.elapsed().as_millis() })
+    }
+}
+
+/// OpenAI-compatible embeddings client (OpenRouter by default) for agent memory.
+/// * `OPENROUTER_API_KEY` (required), `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`)
+/// * `OPENROUTER_EMBED_MODEL` or `--embed-model` (default [`DEFAULT_EMBED_MODEL`])
+#[derive(Clone)]
+pub struct Embedder {
+    http: reqwest::Client,
+    base: String,
+    key: String,
+    pub model: String,
+}
+
+impl std::fmt::Debug for Embedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedder").field("base", &self.base).field("model", &self.model).finish()
+    }
+}
+
+impl Embedder {
+    pub fn from_env(model: Option<String>) -> Option<Self> {
+        let key = std::env::var("OPENROUTER_API_KEY").ok().filter(|s| !s.trim().is_empty())?;
+        let base = std::env::var("OPENROUTER_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+        let model = model
+            .or_else(|| std::env::var("OPENROUTER_EMBED_MODEL").ok())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+        let http = reqwest::Client::builder().timeout(Duration::from_secs(60)).build().ok()?;
+        Some(Self { http, base: base.trim_end_matches('/').to_string(), key, model })
+    }
+
+    pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        let resp = self
+            .http
+            .post(format!("{}/embeddings", self.base))
+            .bearer_auth(&self.key)
+            .json(&json!({"model": self.model, "input": texts}))
+            .send()
+            .await
+            .context("embedding request failed")?;
+        let status = resp.status();
+        let v: Value = resp.json().await.context("embedding response was not JSON")?;
+        if !status.is_success() || v.get("error").is_some() {
+            bail!("embeddings HTTP {status}: {}", v.pointer("/error/message").cloned().unwrap_or(v.clone()));
+        }
+        let mut rows: Vec<(usize, Vec<f32>)> = v["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("embedding response has no data"))?
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let idx = d["index"].as_u64().map(|x| x as usize).unwrap_or(i);
+                let vec = d["embedding"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect()).unwrap_or_default();
+                (idx, vec)
+            })
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        if rows.len() != texts.len() || rows.iter().any(|r| r.1.is_empty()) {
+            bail!("embedding response has {} vectors for {} inputs", rows.len(), texts.len());
+        }
+        Ok(rows.into_iter().map(|r| r.1).collect())
+    }
+
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(self.embed(&[text.to_string()]).await?.remove(0))
+    }
+
+    /// Vector size of the model (needed to create the LanceDB table).
+    pub async fn dimensions(&self) -> Result<usize> {
+        Ok(self.embed_one("dimension probe").await?.len())
     }
 }
 

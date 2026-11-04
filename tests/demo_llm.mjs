@@ -61,6 +61,18 @@ const drawn = await bob.evaluate(() => window.demo.shapes().filter((s) => s.auth
 step(`sketch (LLM) drew: ${drawn.join(", ")}`);
 await sleep(3000); // let animations and the section-box flow settle
 
+// Follow-up that only works with session memory (the previous turn is in the history).
+const repliesBefore = await alice.evaluate(() => window.demo.chat().filter((m) => m.author === "scribe").length);
+const lenBefore = await alice.evaluate(() => window.demo.text().length);
+await send(alice, "@scribe now make that plan shorter: one line per step.");
+await alice.waitForFunction((n) => window.demo.chat().filter((m) => m.author === "scribe").length > n, repliesBefore, { timeout: 240000 })
+  .catch(() => fail("scribe did not answer the follow-up"));
+await sleep(6000); // let the word-by-word typing finish
+const followUp = await alice.evaluate((n) => window.demo.text().slice(n), lenBefore);
+const fuReply = await alice.evaluate(() => window.demo.chat().filter((m) => m.author === "scribe").slice(-1)[0].text);
+if (!/alice|bob|marketing|engineering|build|launch|beta/i.test(followUp + fuReply)) fail("follow-up lost the context: " + followUp + " / " + fuReply);
+step(`follow-up used session memory: ${JSON.stringify(fuReply)}`);
+
 const [a, b] = [await alice.evaluate(() => window.demo.text()), await bob.evaluate(() => window.demo.text())];
 if (a !== b) fail("replicas diverged");
 const replies = await alice.evaluate(() => window.demo.chat().filter((m) => m.kind === "agent").slice(-4).map((m) => `${m.author}: ${m.text}`));

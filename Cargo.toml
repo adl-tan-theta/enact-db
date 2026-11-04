@@ -5,7 +5,7 @@ edition = "2021"
 description = "Single-binary data gateway: DataFusion federation + AgentFS (Turso) agent state over HTTP"
 
 [features]
-default = ["azure", "postgres", "iceberg"]
+default = ["azure", "postgres", "iceberg", "lancedb"]
 azure = ["object_store/azure"]
 # Iceberg REST catalogs (Lakekeeper, Polaris, Unity, ...) with S3/ADLS/local storage
 iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:typetag", "dep:arrow_array58", "dep:arrow_schema58", "dep:arrow_ipc58", "object_store/aws"]

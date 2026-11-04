@@ -68,6 +68,12 @@ pub struct AgentArgs {
     /// Use the built-in scripted commands even if an LLM is configured
     #[arg(long)]
     pub no_llm: bool,
+    /// Embedding model for long-term memory (OpenRouter; see `demo::llm::Embedder`)
+    #[arg(long, env = "OPENROUTER_EMBED_MODEL")]
+    pub embed_model: Option<String>,
+    /// Disable long-term (LanceDB) memory; session history still applies
+    #[arg(long)]
+    pub no_memory: bool,
 }
 
 const REMOTE: &str = "remote";
@@ -76,6 +82,7 @@ pub struct Agent {
     pub name: String,
     persona: String,
     llm: Option<super::llm::Llm>,
+    embedder: Option<super::llm::Embedder>,
     color: String,
     doc_id: String,
     speed: Duration,
@@ -191,10 +198,18 @@ async fn session(args: &AgentArgs, color: &str) -> Result<()> {
         Some(l) => tracing::info!(agent = %args.name, model = %l.model, "agent brain: LLM"),
         None => tracing::info!(agent = %args.name, "agent brain: scripted commands (no OPENAI_COMPATIBLE_* configured)"),
     }
+    let embedder = if args.no_memory || llm.is_none() { None } else { super::llm::Embedder::from_env(args.embed_model.clone()) };
+    if llm.is_some() {
+        match &embedder {
+            Some(e) => tracing::info!(agent = %args.name, model = %e.model, "agent memory: session history (AgentFS) + long-term recall (LanceDB)"),
+            None => tracing::info!(agent = %args.name, "agent memory: session history (AgentFS) only (no OPENROUTER_API_KEY)"),
+        }
+    }
     let agent = Arc::new(Agent {
         name: args.name.clone(),
         persona: args.persona.clone(),
         llm,
+        embedder,
         color: color.to_string(),
         doc_id: args.doc.clone(),
         speed: Duration::from_millis(args.speed_ms.max(1)),
@@ -564,7 +579,11 @@ fn system_prompt(name: &str, persona: &str) -> String {
          - {{\"type\": \"box\", \"label\": \"...\"}}  rectangle; also \"ellipse\" and \"note\" (sticky note)\n\
          - {{\"type\": \"arrow\", \"from\": \"label\", \"to\": \"label\"}}  between existing or just-drawn shapes\n\
          - {{\"type\": \"path\", \"points\": [[x,y], ...]}}  freehand stroke, 2-200 points inside 1000x700\n\
-         Only use actions that fit your role. Keep labels under 24 characters. \
+         - {{\"type\": \"remember\", \"text\": \"...\"}}  store a durable fact, decision or preference in your long-term memory\n\
+         You have memory: earlier turns of this session are in the conversation, and relevant \
+         long-term memories (from any session) are listed with each request. Use them for follow-ups \
+         like \"make it shorter\" or \"what did we decide\". \
+         Only use actions that fit your role (remember is for everyone). Keep labels under 24 characters. \
          If the request is not for you or needs nothing, return an empty actions list."
     )
 }
@@ -576,8 +595,23 @@ impl Agent {
         self.status("thinking");
         let started = crate::agents::now_secs();
         let system = system_prompt(&self.name, &self.persona);
-        let user = self.context(who, request);
-        let result = llm.complete(&system, &user).await;
+        // Memory: session history from AgentFS (Turso), relevant long-term memories from LanceDB.
+        let history = self.load_history(6).await;
+        let memories = self.recall(request).await;
+        let mut user = self.context(who, request);
+        if !memories.is_empty() {
+            user = format!(
+                "Relevant long-term memories (most relevant first):\n{}\n\n{user}",
+                memories.iter().map(|m| format!("- {m}")).collect::<Vec<_>>().join("\n")
+            );
+        }
+        let mut messages = vec![json!({"role": "system", "content": system})];
+        for t in &history {
+            messages.push(json!({"role": "user", "content": format!("Request from {}: {}", t["who"].as_str().unwrap_or("?"), t["request"].as_str().unwrap_or(""))}));
+            messages.push(json!({"role": "assistant", "content": json!({"reply": t["reply"], "actions": t["actions"]}).to_string()}));
+        }
+        messages.push(json!({"role": "user", "content": user}));
+        let result = llm.chat(messages).await;
         let (raw, usage, latency) = match result {
             Ok(c) => (c.text, c.usage, c.latency_ms),
             Err(e) => {
@@ -606,16 +640,28 @@ impl Agent {
         }
         let mut done = vec![];
         for a in &actions {
-            match self.act(a).await {
+            match self.act(a, who).await {
                 Ok(d) => done.push(d),
                 Err(e) => done.push(format!("skipped: {e}")),
             }
         }
         self.status("idle");
 
+        // Session transcript (AgentFS) and long-term memory (LanceDB).
+        let proposed = Value::Array(actions.clone());
+        self.append_turn(json!({"ts": now_ms(), "who": who, "request": request, "reply": reply, "actions": proposed, "executed": done}))
+            .await;
+        if parsed.is_some() {
+            let summary = format!("{who} asked: {request} | I replied: {reply} | I did: {}", done.join("; "));
+            if let Err(e) = self.memorize(&short(&summary, 1500), "turn", who).await {
+                tracing::debug!(agent = %self.name, error = %e, "turn not stored in long-term memory");
+            }
+        }
+
         // Everything about this exchange goes into the agent's own AgentFS sandbox.
         let record = json!({
             "ts": now_ms(), "agent": self.name, "persona": self.persona, "model": llm.model,
+            "history_turns": history.len(), "memories": memories,
             "requested_by": who, "request": request, "system": system, "context": user,
             "raw_response": raw, "parsed": parsed, "executed": done, "usage": usage, "latency_ms": latency,
         });
@@ -683,7 +729,7 @@ impl Agent {
     }
 
     /// Execute one model-proposed action. Returns a short description.
-    async fn act(&self, a: &Value) -> Result<String> {
+    async fn act(&self, a: &Value, who: &str) -> Result<String> {
         let kind = a["type"].as_str().unwrap_or("").to_lowercase();
         let label = |k: &str| short(a[k].as_str().unwrap_or("").trim(), 40);
         match kind.as_str() {
@@ -743,8 +789,107 @@ impl Agent {
                 self.draw_path(&pts).await;
                 Ok(format!("path {} points", pts.len()))
             }
+            "remember" | "memorize" | "memory" => {
+                let text = a["text"].as_str().or_else(|| a["fact"].as_str()).unwrap_or("").trim();
+                if text.is_empty() {
+                    bail!("empty remember");
+                }
+                if self.embedder.is_none() {
+                    bail!("long-term memory is not configured");
+                }
+                self.memorize(&short(text, 1000), "fact", who).await?;
+                Ok(format!("remembered \"{}\"", short(text, 60)))
+            }
             other => bail!("unknown action '{other}'"),
         }
+    }
+
+    fn memory_namespace(&self) -> String {
+        format!("agent-{}", self.name)
+    }
+
+    fn session_path(&self) -> String {
+        format!("sessions/{}.jsonl", self.doc_id)
+    }
+
+    /// The last `n` turns of this session, from the agent's AgentFS (Turso).
+    async fn load_history(&self, n: usize) -> Vec<Value> {
+        let url = format!("{}/v1/agents/{}/fs/{}", self.base, self.name, self.session_path());
+        let Ok(r) = self.http.get(url).bearer_auth(&self.token).send().await else { return vec![] };
+        if !r.status().is_success() {
+            return vec![];
+        }
+        let body = r.text().await.unwrap_or_default();
+        let turns: Vec<Value> = body.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        turns.into_iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect()
+    }
+
+    /// Append one turn to the session transcript in AgentFS (the agent is its only writer).
+    async fn append_turn(&self, turn: Value) {
+        let url = format!("{}/v1/agents/{}/fs/{}", self.base, self.name, self.session_path());
+        let mut body = match self.http.get(&url).bearer_auth(&self.token).send().await {
+            Ok(r) if r.status().is_success() => r.bytes().await.map(|b| b.to_vec()).unwrap_or_default(),
+            _ => vec![],
+        };
+        body.extend_from_slice(turn.to_string().as_bytes());
+        body.push(b'\n');
+        if let Err(e) = self.http.put(&url).bearer_auth(&self.token).body(body).send().await {
+            tracing::warn!(agent = %self.name, error = %e, "session transcript not saved");
+        }
+    }
+
+    /// Semantic search over this agent's long-term memory (LanceDB via /v1/memory).
+    async fn recall(&self, query: &str) -> Vec<String> {
+        let Some(emb) = &self.embedder else { return vec![] };
+        let vector = match emb.embed_one(query).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(agent = %self.name, error = %e, "recall: embedding failed");
+                return vec![];
+            }
+        };
+        let r = self
+            .http
+            .post(format!("{}/v1/memory/search", self.base))
+            .bearer_auth(&self.token)
+            .json(&json!({"namespace": self.memory_namespace(), "embedding": vector, "k": 5}))
+            .send()
+            .await;
+        let Ok(r) = r else { return vec![] };
+        let v: Value = r.json().await.unwrap_or(Value::Null);
+        v["hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .filter_map(|h| {
+                        let content = h["content"].as_str()?;
+                        let kind = h.pointer("/metadata/kind").and_then(|k| k.as_str()).unwrap_or("memory");
+                        Some(format!("({kind}) {content}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Embed and store a memory (kind: "turn" or "fact") in LanceDB via /v1/memory.
+    async fn memorize(&self, content: &str, kind: &str, who: &str) -> Result<()> {
+        let emb = self.embedder.as_ref().ok_or_else(|| anyhow!("no embedder"))?;
+        let vector = emb.embed_one(content).await?;
+        let id = format!("{kind}-{}-{}", now_ms(), self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let r = self
+            .http
+            .post(format!("{}/v1/memory", self.base))
+            .bearer_auth(&self.token)
+            .json(&json!({
+                "namespace": self.memory_namespace(), "id": id, "content": content, "embedding": vector,
+                "metadata": {"kind": kind, "who": who, "doc": self.doc_id, "ts": now_ms(), "model": emb.model},
+            }))
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            bail!("memory upsert: HTTP {}: {}", r.status(), r.text().await.unwrap_or_default());
+        }
+        Ok(())
     }
 
     /// Next free slot in this agent's "requested shapes" band (below the section flow).

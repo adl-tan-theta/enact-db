@@ -39,6 +39,12 @@ pub struct DemoArgs {
     /// Use scripted agents even if OPENAI_COMPATIBLE_* is configured
     #[arg(long)]
     pub no_llm: bool,
+    /// Embedding model for agent long-term memory (OpenRouter; default nvidia/nemotron-3.5-embed-1b:free)
+    #[arg(long, env = "OPENROUTER_EMBED_MODEL")]
+    pub embed_model: Option<String>,
+    /// Disable long-term memory (LanceDB); session history in AgentFS still applies
+    #[arg(long)]
+    pub no_memory: bool,
 }
 
 fn random_token() -> Result<String> {
@@ -85,7 +91,42 @@ impl Admin {
 pub async fn run(args: DemoArgs) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
     let admin_token = random_token()?;
+
+    // Long-term agent memory: LanceDB, sized for the embedding model (probed once).
+    let mut memory_note = "off (no OPENROUTER_API_KEY; agents keep session history in AgentFS)".to_string();
+    let mut config = None;
+    let embedder = if args.no_llm || args.no_memory || llm::Llm::from_env(args.model.clone()).is_none() {
+        None
+    } else {
+        llm::Embedder::from_env(args.embed_model.clone())
+    };
+    if let Some(e) = &embedder {
+        match e.dimensions().await {
+            Ok(dims) if cfg!(feature = "lancedb") => {
+                let slug: String = e.model.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                let uri = std::fs::canonicalize(&args.data_dir)?.join("lancedb").join(slug);
+                let path = args.data_dir.join("enact-db-demo.toml");
+                std::fs::write(
+                    &path,
+                    format!(
+                        "[memory]\nbackend = \"lancedb\"\nlancedb_uri = \"{}\"\ndimensions = {dims}\n",
+                        uri.display().to_string().replace('\\', "/")
+                    ),
+                )?;
+                config = Some(path);
+                memory_note = format!("LanceDB ({} dims, {}) at {}", dims, e.model, uri.display());
+            }
+            Ok(dims) => {
+                memory_note = format!("{} ({dims} dims) in the local Turso store (built without lancedb)", e.model);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "embedding model unavailable; long-term memory disabled");
+                memory_note = format!("off (embedding model {} failed: {err})", e.model);
+            }
+        }
+    }
     let serve_args = crate::ServeArgs {
+        config,
         listen: Some(args.listen),
         data_dir: Some(args.data_dir.clone()),
         token: Some(admin_token.clone()),
@@ -109,6 +150,10 @@ pub async fn run(args: DemoArgs) -> Result<()> {
     admin.grant("user:carol", &format!("doc:{doc}"), "select").await?;
     admin.grant("user:carol", &format!("transcript:{doc}"), "select").await?;
     admin.grant("user:carol", "table:gateway/system/agent_tool_calls", "select").await?;
+    // each agent owns its own memory namespace
+    for a in ["scribe", "sketch"] {
+        admin.grant(&format!("agent:{a}"), &format!("memory:agent-{a}"), "ownership").await?;
+    }
 
     let mut tokens = BTreeMap::new();
     for p in ["user:alice", "user:bob", "user:carol", "agent:scribe", "agent:sketch"] {
@@ -128,6 +173,8 @@ pub async fn run(args: DemoArgs) -> Result<()> {
                 color: None,
                 model: args.model.clone(),
                 no_llm: args.no_llm,
+                embed_model: args.embed_model.clone(),
+                no_memory: args.no_memory || embedder.is_none(),
             };
             tokio::spawn(async move {
                 if let Err(e) = agent::run(a).await {
@@ -153,6 +200,7 @@ pub async fn run(args: DemoArgs) -> Result<()> {
          carol (viewer):  {}\n\n  \
          Agents scribe (writes) and sketch (draws) are {}.\n  \
          Agent brain: {}\n  \
+         Agent memory: session history in AgentFS (Turso); long-term {}\n  \
          In the chat try: @scribe summarize   @sketch box Risks   @sketch smile\n\n  \
          Admin token (break-glass): {admin_token}\n  Ctrl-C to stop.\n",
         link("alice"),
@@ -162,7 +210,8 @@ pub async fn run(args: DemoArgs) -> Result<()> {
         match (args.no_llm, llm::Llm::from_env(args.model.clone())) {
             (false, Some(l)) => format!("LLM {} (ask them anything with @scribe / @sketch)", l.model),
             _ => "scripted commands (set OPENAI_COMPATIBLE_BASE_URL / _API_KEY for an LLM)".to_string(),
-        }
+        },
+        memory_note
     );
 
     server.await??;

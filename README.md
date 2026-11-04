@@ -79,12 +79,36 @@ Reasoning blocks (`<think>…</think>`) and code fences are stripped before
 parsing, and unknown actions are skipped and logged. Without the variables
 (or with `--no-llm`) the agents use the built-in commands.
 
+**Agent memory.**
+* **Session (short-term):** each agent appends every turn (request, reply,
+  proposed and executed actions) to `sessions/<doc>.jsonl` in its own AgentFS,
+  stored in Turso. The last 6 turns go back to the model as chat history, so
+  follow-ups like "make it shorter" work.
+* **Long-term (semantic):** every turn, plus anything the model decides to
+  `remember` (decisions, preferences, facts), is embedded through OpenRouter and
+  stored in **LanceDB** via `/v1/memory`. Each agent gets a private namespace
+  (`memory:agent-<name>`, owned by that agent). Before each model call the
+  agent searches it and puts the closest memories in the prompt, so it
+  remembers across sessions and restarts.
+
+```bash
+export OPENROUTER_API_KEY=…
+export OPENROUTER_EMBED_MODEL=nvidia/nemotron-3.5-embed-1b:free   # default
+# alternatives: nvidia/nemotron-3.5-embed-8b:free, amazon/titan-embed-text-v1
+enact-db demo        # probes the model's dimensions and creates data/lancedb/<model>
+```
+
+LanceDB is a default feature, so building needs `protoc`. Without
+`OPENROUTER_API_KEY` (or with `--no-memory`) agents keep session memory only.
+
 Where agent data goes:
 
 | Data | Store |
 |---|---|
 | Document, board and chat (CRDT) | `data/hub.db` (Turso), as an update log compacted into snapshots |
-| Each LLM exchange (context, raw reply, parsed actions, executed actions, model, tokens, latency) | the agent's **AgentFS** at `/llm/<ts>.json`, plus an `llm.respond` tool call |
+| Session transcript (per agent, per document) | the agent's **AgentFS** `sessions/<doc>.jsonl` (Turso) |
+| Long-term memory embeddings (turns and remembered facts) | **LanceDB** (`data/lancedb/<embedding-model>`), namespace `agent-<name>` |
+| Each LLM exchange (context, history size, recalled memories, raw reply, actions, model, tokens, latency) | the agent's **AgentFS** at `/llm/<ts>.json`, plus an `llm.respond` tool call |
 | Agent actions (`doc.write`, `canvas.draw`, …) | the agent's AgentFS `tool_calls`, which are also queryable as `system.agent_tool_calls` |
 | Chat as a transcript | the outbox in `hub.db`, then DuckDB / Postgres sinks |
 | Permission decisions | `data/authz.db` audit log |
@@ -92,7 +116,11 @@ Where agent data goes:
 The API key is only read from the environment. It's never stored or logged.
 
 `tests/llm_agents.rs` runs the agents against a mock OpenAI-compatible server
-(deterministic, in CI). `node tests/demo_llm.mjs target/debug/enact-db` runs
+(deterministic, in CI). `tests/agent_memory.rs` covers memory:
+* a follow-up that needs the session history
+* `remember` into LanceDB
+* privacy of the agent's memory
+* recall after a full restart `node tests/demo_llm.mjs target/debug/enact-db` runs
 two humans in Chromium against the real model.
 
 The agents are real CRDT peers. They use the same WebSocket protocol, an
@@ -128,7 +156,7 @@ enact-db agent --server http://host:9494 --token edb_… --name scribe --persona
 ## Build
 
 ```bash
-cargo build --release                                  # azure + postgres + iceberg (default)
+cargo build --release                                  # azure + postgres + iceberg + lancedb (default)
 cargo build --release --features duckdb                # + DuckDB transcript sink
 cargo build --release --features lancedb               # + LanceDB memory backend
 cargo build --release --features full                  # everything except snowflake
