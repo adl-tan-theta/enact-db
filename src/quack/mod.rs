@@ -47,7 +47,6 @@ const BATCH_ROWS: usize = 16 * vector::VECTOR_SIZE;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 const CATALOG: &str = "gateway";
-const SCHEMAS: [(&str, &str, i64); 2] = [("main", "public", 1), ("system", "system", 2)];
 
 pub struct QuackServer {
     ctx: SessionContext,
@@ -299,7 +298,30 @@ impl QuackServer {
         Ok((schema, Some(stream)))
     }
 
+    /// Every schema exposed to DuckDB clients, in a stable order: the gateway's
+    /// `public` (as `main`) and `system`, then each mounted catalog (e.g. an
+    /// Iceberg catalog `lake`) as nested schemas `lake.<namespace>`.
+    pub fn quack_schemas(&self) -> Vec<QSchema> {
+        let mut out = vec![
+            QSchema { oid: 1, path: vec!["main".into()], catalog: CATALOG.into(), schema: "public".into() },
+            QSchema { oid: 2, path: vec!["system".into()], catalog: CATALOG.into(), schema: "system".into() },
+        ];
+        let mut catalogs = self.ctx.catalog_names();
+        catalogs.sort();
+        for c in catalogs.into_iter().filter(|c| c != CATALOG) {
+            let Some(cat) = self.ctx.catalog(&c) else { continue };
+            let mut schemas = cat.schema_names();
+            schemas.sort();
+            for s in schemas.into_iter().filter(|s| s != "information_schema") {
+                let oid = out.len() as i64 + 1;
+                out.push(QSchema { oid, path: vec![c.clone(), s.clone()], catalog: c.clone(), schema: s });
+            }
+        }
+        out
+    }
+
     fn schema_rows(&self) -> Result<RecordBatch> {
+        let schemas = self.quack_schemas();
         let schema = Arc::new(Schema::new(vec![
             Field::new("oid", DataType::Int64, false),
             Field::new("database_name", DataType::Utf8, false),
@@ -307,32 +329,37 @@ impl QuackServer {
             Field::new("current_database()", DataType::Utf8, false),
         ]));
         let mut paths = ListBuilder::new(StringBuilder::new());
-        for (duck, _, _) in SCHEMAS {
-            paths.values().append_value(duck);
+        for q in &schemas {
+            for part in &q.path {
+                paths.values().append_value(part);
+            }
             paths.append(true);
         }
         Ok(RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int64Array::from(SCHEMAS.iter().map(|s| s.2).collect::<Vec<_>>())) as ArrayRef,
-                Arc::new(StringArray::from(vec![CATALOG; SCHEMAS.len()])),
+                Arc::new(Int64Array::from(schemas.iter().map(|s| s.oid).collect::<Vec<_>>())) as ArrayRef,
+                Arc::new(StringArray::from(vec![CATALOG; schemas.len()])),
                 Arc::new(paths.finish()),
-                Arc::new(StringArray::from(vec![CATALOG; SCHEMAS.len()])),
+                Arc::new(StringArray::from(vec![CATALOG; schemas.len()])),
             ],
         )?)
     }
 
     async fn table_rows(&self) -> Result<RecordBatch> {
         let (mut oids, mut sqls) = (vec![], vec![]);
-        let cat = self.ctx.catalog(CATALOG).ok_or_else(|| anyhow!("catalog {CATALOG} missing"))?;
-        for (_, df_schema, oid) in SCHEMAS {
-            let Some(s) = cat.schema(df_schema) else { continue };
+        for q in self.quack_schemas() {
+            let Some(s) = self.ctx.catalog(&q.catalog).and_then(|c| c.schema(&q.schema)) else { continue };
             let mut names = s.table_names();
             names.sort();
             for name in names {
-                if let Ok(Some(t)) = s.table(&name).await {
-                    oids.push(oid);
-                    sqls.push(vector::create_table_sql(&name, &t.schema()));
+                match s.table(&name).await {
+                    Ok(Some(t)) => {
+                        oids.push(q.oid);
+                        sqls.push(vector::create_table_sql(&name, &t.schema()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(table = %name, error = %e, "skipping table in quack catalog"),
                 }
             }
         }
@@ -358,11 +385,11 @@ impl QuackServer {
     async fn translate(&self, sql: &str) -> String {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if let Some((select, from)) = split_scan(trimmed) {
-            if let Some((df_schema, table, schema)) = self.resolve(from).await {
+            if let Some((q, table, schema)) = self.resolve(from).await {
                 let target = format!(
                     "{}.{}.{}",
-                    vector::quote_ident(CATALOG),
-                    vector::quote_ident(df_schema),
+                    vector::quote_ident(&q.catalog),
+                    vector::quote_ident(&q.schema),
                     vector::quote_ident(&table)
                 );
                 let list = match select {
@@ -390,19 +417,31 @@ impl QuackServer {
         trimmed.to_string()
     }
 
-    /// Resolve a DuckDB-side qualified name to (datafusion schema, table, arrow schema).
-    async fn resolve(&self, name: &str) -> Option<(&'static str, String, SchemaRef)> {
-        let parts = split_ident_path(name)?;
-        let (duck_schema, table) = match parts.as_slice() {
-            [t] => ("main".to_string(), t.clone()),
-            [s, t] => (s.clone(), t.clone()),
-            [_c, s, t] => (s.clone(), t.clone()),
-            _ => return None,
-        };
-        let (_, df_schema, _) = SCHEMAS.iter().find(|(d, _, _)| d.eq_ignore_ascii_case(&duck_schema))?;
-        let t = self.ctx.catalog(CATALOG)?.schema(df_schema)?.table(&table).await.ok()??;
-        Some((df_schema, table, t.schema()))
+    /// Resolve a DuckDB-side qualified name (`t`, `main.t`, `lake.sales.t`,
+    /// optionally prefixed by the catalog name) to (schema, table, arrow schema).
+    async fn resolve(&self, name: &str) -> Option<(QSchema, String, SchemaRef)> {
+        let mut parts = split_ident_path(name)?;
+        if parts.len() == 1 {
+            parts.insert(0, "main".into());
+        }
+        let table = parts.pop()?;
+        let schemas = self.quack_schemas();
+        let eq = |a: &[String], b: &[String]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y));
+        let q = schemas
+            .into_iter()
+            .find(|q| eq(&parts, &q.path) || (parts.len() == q.path.len() + 1 && parts[0].eq_ignore_ascii_case(CATALOG) && eq(&parts[1..], &q.path)))?;
+        let t = self.ctx.catalog(&q.catalog)?.schema(&q.schema)?.table(&table).await.ok()??;
+        Some((q, table, t.schema()))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct QSchema {
+    pub oid: i64,
+    /// Schema path as DuckDB sees it (["main"], ["lake", "sales"]).
+    pub path: Vec<String>,
+    pub catalog: String,
+    pub schema: String,
 }
 
 /// `SELECT <list> FROM <name>` / `FROM <name>` where name is a plain identifier path.

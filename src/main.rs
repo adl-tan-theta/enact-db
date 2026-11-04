@@ -12,6 +12,8 @@ mod catalog;
 mod config;
 mod crdt;
 mod databricks;
+#[cfg(feature = "iceberg")]
+mod iceberg;
 mod memory;
 #[cfg(feature = "postgres")]
 mod pg;
@@ -59,6 +61,9 @@ struct Extra {
     blob: blob::BlobConfig,
     #[serde(default)]
     quack: QuackConfig,
+    #[cfg(feature = "iceberg")]
+    #[serde(default)]
+    iceberg: Vec<iceberg::IcebergConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -112,6 +117,12 @@ async fn main() -> Result<()> {
 
     let ctx = catalog::build_context(&cfg.sources).await?;
     systables::register(&ctx, agents.clone(), hub.clone(), store.clone())?;
+    #[allow(unused_mut)]
+    let mut sources: Vec<String> = cfg.sources.iter().map(|s| s.name().to_string()).collect();
+    #[cfg(feature = "iceberg")]
+    for name in iceberg::register_all(&ctx, &extra.iceberg).await? {
+        sources.push(format!("{name} (iceberg)"));
+    }
 
     let quack_token = extra.quack.token.clone().or_else(|| cfg.server.auth_token.clone());
     let quack = Arc::new(quack::QuackServer::new(ctx.clone(), quack_token));
@@ -124,7 +135,7 @@ async fn main() -> Result<()> {
         store,
         memory,
         blob: blob.clone(),
-        sources: cfg.sources.iter().map(|s| s.name().to_string()).collect(),
+        sources,
         sinks,
         cfg: cfg.server.clone(),
         peer_seq: AtomicU64::new(1),
