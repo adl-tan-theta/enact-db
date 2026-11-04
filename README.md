@@ -470,28 +470,22 @@ node tests/browser.mjs http://127.0.0.1:9494 # two Chromium users + an HTTP agen
 * `tests/iceberg.rs` writes a real Iceberg table with iceberg-rust and serves it
   through a spec-shaped REST catalog with a bearer token. It covers pushdown,
   `count(*)`, a join with a CSV source, a new snapshot appearing mid-test, and Quack.
+* `tests/llm_agents.rs` and `tests/agent_memory.rs` run the LLM agents against
+  a mock model and a mock embeddings endpoint. They cover actions, session
+  history, `remember`, private memory and recall after a restart.
+* `tests/demo.mjs` runs the multiplayer demo in Chromium: 2 humans, 2 agents
+  and a read-only viewer. `tests/demo_llm.mjs` and `tests/memory_live.mjs` do
+  the same against the real model and embeddings (skipped without keys).
 * `tests/browser.mjs` runs the built-in page in Chromium: two humans type and
   an agent edits over HTTP, then it checks that all copies match, that presence
   shows `alice | bob | planner (agent)`, and that the SQL-driven activity feed updates.
 
 ## Status and roadmap
 
-Verified as above: CRDT hub, AgentFS sandboxes, all memory backends (Turso,
-pgvector, LanceDB), the transcript outbox with DuckDB and Postgres sinks, SQL
-federation (files, Postgres, system tables), and the blob tier (`file://`).
-
-Implemented but not yet verified against the live service: Azure Blob (it goes
-through the same `object_store` code path as `file://`, plus `az://`
-credentials), Snowflake via ADBC, a live Databricks workspace (tested against
-an API-contract mock), and a live DuckDB client over Quack (tested against an
-independent decoder of DuckDB's wire format).
-
-Known upstream issue: in turso 0.4.4, an index on `(x, rowid_alias)` makes
-`x = ? AND rowid_alias > ?` return no rows. `src/store.rs` works around it with
-`+seq`; it's worth reporting upstream.
-
-Next:
-* **Quack writes**: accept SEND_DATA (`INSERT INTO gw...`) into AgentFS/Turso tables.
-* **TLS listener** built in, for remote Quack and HTTPS without a proxy.
-* **Server-side embeddings** (call an embedding model on upsert/search), **per-doc ACLs**, and
-  **Turso Cloud sync** for AgentFS (`AgentFSOptions::with_sync`) as an alternative to blob push/pull.
+See [`docs/STATUS.md`](docs/STATUS.md) for:
+* what is built
+* where each kind of data lives
+* how each part was verified: real services, mocks, or not yet
+* the embedding models that were tried
+* the next steps: a catalog UI, Quack writes, live checks of Azure, Snowflake,
+  Databricks and Lakekeeper, server-side embeddings, and smaller items
