@@ -56,7 +56,7 @@ fn project(sql: &str) -> RecordBatch {
         return full;
     }
     if sel.starts_with("1 AS") {
-        let s = Arc::new(Schema::new(vec![Field::new("__agentgate_rowcount", DataType::Int64, false)]));
+        let s = Arc::new(Schema::new(vec![Field::new("__enact_db_rowcount", DataType::Int64, false)]));
         return RecordBatch::try_new(s, vec![Arc::new(Int64Array::from(vec![1, 1, 1, 1]))]).unwrap();
     }
     let idx: Vec<usize> = sel
@@ -212,7 +212,7 @@ async fn start_gateway(dir: &std::path::Path, mock: &str, table_line: &str) -> (
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentgate"))
+    let child = Command::new(env!("CARGO_BIN_EXE_enact-db"))
         .arg("--config")
         .arg(&cfg)
         .env("DBX_TOKEN", "dapi-test-token")

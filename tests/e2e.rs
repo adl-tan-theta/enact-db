@@ -32,7 +32,7 @@ fn free_port() -> u16 {
 }
 
 async fn start(dir: &std::path::Path, port: u16) -> Server {
-    let cfg = dir.join("agentgate.toml");
+    let cfg = dir.join("enact-db.toml");
     let blob_dir = dir.join("blob");
     std::fs::write(
         &cfg,
@@ -60,13 +60,13 @@ location = "{csv}"
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentgate"))
+    let child = Command::new(env!("CARGO_BIN_EXE_enact-db"))
         .arg("--config")
         .arg(&cfg)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
-        .expect("spawn agentgate");
+        .expect("spawn enact-db");
     let base = format!("http://127.0.0.1:{port}");
     for _ in 0..200 {
         if reqwest::get(format!("{base}/health")).await.is_ok() {

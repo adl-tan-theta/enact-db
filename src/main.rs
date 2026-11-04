@@ -1,4 +1,4 @@
-//! agentgate – one binary for multiplayer (human + agent) AI workspaces.
+//! enact-db – one binary for multiplayer (human + agent) AI workspaces.
 //!
 //! * DataFusion federation over Postgres / Snowflake / Azure Blob / local files
 //! * AgentFS (Turso) sandboxes per agent: files, KV, tool-call audit
@@ -29,19 +29,19 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "agentgate", version, about)]
+#[command(name = "enact-db", version, about)]
 struct Args {
-    /// Path to agentgate.toml
-    #[arg(short, long, env = "AGENTGATE_CONFIG")]
+    /// Path to enact-db.toml
+    #[arg(short, long, env = "ENACT_DB_CONFIG")]
     config: Option<PathBuf>,
     /// Override [server] listen address
-    #[arg(long, env = "AGENTGATE_LISTEN")]
+    #[arg(long, env = "ENACT_DB_LISTEN")]
     listen: Option<std::net::SocketAddr>,
     /// Override [server] data_dir
-    #[arg(long, env = "AGENTGATE_DATA_DIR")]
+    #[arg(long, env = "ENACT_DB_DATA_DIR")]
     data_dir: Option<PathBuf>,
     /// Override [server] auth_token
-    #[arg(long, env = "AGENTGATE_TOKEN")]
+    #[arg(long, env = "ENACT_DB_TOKEN")]
     token: Option<String>,
     /// Pull these agents from the blob tier before serving (cloud sandbox boot).
     #[arg(long = "pull-agent")]
@@ -72,7 +72,7 @@ struct QuackConfig {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "agentgate=info,warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "enact_db=info,warn".into()),
         )
         .init();
 
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
         data_dir = %data_dir.display(),
         memory = state.memory.backend_name(),
         auth = cfg.server.auth_token.is_some(),
-        "agentgate listening"
+        "enact-db listening"
     );
     axum::serve(listener, server::router(state))
         .with_graceful_shutdown(async {

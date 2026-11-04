@@ -1,4 +1,4 @@
-# agentgate
+# enact-db
 
 One Rust binary for **multiplayer AI workspaces**: humans in browsers and AI
 agents (local or in cloud sandboxes) working on the same live state, with
@@ -6,10 +6,10 @@ memory, transcripts, and enterprise data behind a single endpoint.
 
 ```
  Browser (Yjs + y-websocket)        Agents (HTTP / Yjs / pycrdt)       Cloud sandbox agents
-          │  ws://…/ws/{doc}                 │  /v1/...                  agentgate --pull-agent X
+          │  ws://…/ws/{doc}                 │  /v1/...                  enact-db --pull-agent X
           └──────────────────┬───────────────┘                                   │
                              ▼                                                   │
-┌───────────────────────────── agentgate (single binary) ─────────────────────────┴───┐
+┌───────────────────────────── enact-db (single binary) ─────────────────────────┴───┐
 │  CRDT hub (yrs)       AgentFS sandboxes      Memory           Transcripts           │
 │  y-protocols sync,    per-agent Turso file:  turso vectors |  local outbox ──► DuckDB│
 │  presence, fan-out,   fs + kv + tool_calls   pgvector |       (cursor per sink) ──► │
@@ -47,7 +47,7 @@ cargo build --release --features full                  # everything except snowf
 cargo build --release --features snowflake             # + Snowflake via ADBC driver
 ```
 
-The result is `target/release/agentgate`. The Snowflake feature loads the ADBC
+The result is `target/release/enact-db`. The Snowflake feature loads the ADBC
 Snowflake driver shared library at runtime. Everything else is compiled in,
 including DuckDB's `json` extension and the browser's Yjs/y-websocket bundle,
 so the binary never downloads anything at runtime and works air-gapped.
@@ -66,10 +66,10 @@ managed cloud Postgres.
 ## Run
 
 ```bash
-./agentgate                                   # local only, 127.0.0.1:9494, ./data
-./agentgate --config agentgate.toml
-AGENTGATE_TOKEN=secret ./agentgate --listen 0.0.0.0:9494
-./agentgate --config cloud.toml --pull-agent researcher   # cloud sandbox boot
+./enact-db                                   # local only, 127.0.0.1:9494, ./data
+./enact-db --config enact-db.toml
+ENACT_DB_TOKEN=secret ./enact-db --listen 0.0.0.0:9494
+./enact-db --config cloud.toml --pull-agent researcher   # cloud sandbox boot
 ```
 
 Open `http://127.0.0.1:9494/` for the built-in multiplayer workspace: a Yjs
@@ -77,7 +77,7 @@ editor with presence and a live agent-activity feed. Open it in two tabs and
 use "Ask an agent to write" to see a human and an agent co-editing. With auth
 enabled, add `?token=…` to the URL.
 
-See [`agentgate.example.toml`](agentgate.example.toml) for every option.
+See [`enact-db.example.toml`](enact-db.example.toml) for every option.
 
 ## API
 
@@ -157,7 +157,7 @@ Queries are read-only unless `allow_sql_writes = true`. Agent queries (with
 
 ### Quack (DuckDB client-server protocol)
 
-agentgate speaks Quack v3 at `POST /quack` on its main port, so any DuckDB can
+enact-db speaks Quack v3 at `POST /quack` on its main port, so any DuckDB can
 attach the whole gateway (federated sources plus live agent state) as a database:
 
 ```sql
@@ -169,7 +169,7 @@ FROM quack_query('gw', 'SELECT ... any DataFusion SQL ...');
 ```
 
 * At ATTACH, the client's catalog queries (`duckdb_schemas()`/`duckdb_tables()`)
-  are answered from agentgate's catalog: `public` appears as `main`, next to `system`.
+  are answered from enact-db's catalog: `public` appears as `main`, next to `system`.
 * Scans arrive as `SELECT #1, #3 FROM main.t` and run on DataFusion. Results
   stream as DuckDB DataChunks: rows are inlined in PREPARE up to `inline_rows`,
   then sent as FETCH batches. Retries and out-of-order fetch-ahead are served
@@ -199,7 +199,7 @@ is never sent to the presigned storage links; only the headers Databricks return
 
 ```bash
 cargo test                                   # unit + tests/e2e.rs (no services needed)
-AGENTGATE_TEST_PG="host=127.0.0.1 user=agent password=agentpw dbname=agents" \
+ENACT_DB_TEST_PG="host=127.0.0.1 user=agent password=agentpw dbname=agents" \
   cargo test --features full                 # + real Postgres/pgvector, DuckDB, LanceDB
 node tests/browser.mjs http://127.0.0.1:9494 # two Chromium users + an HTTP agent co-editing
 ```

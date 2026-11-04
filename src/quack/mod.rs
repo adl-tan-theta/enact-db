@@ -1,6 +1,6 @@
 //! Quack (DuckDB client-server protocol, v3) endpoint.
 //!
-//! DuckDB clients attach agentgate like any Quack server:
+//! DuckDB clients attach enact-db like any Quack server:
 //!
 //! ```sql
 //! CREATE SECRET (TYPE quack, TOKEN 'secret');       -- if a token is configured
@@ -13,7 +13,7 @@
 //! What the server does with each request:
 //! * CONNECT: checks the token against `[quack] token` (or the server token)
 //! * the two catalog queries a client sends at ATTACH (`duckdb_schemas()` /
-//!   `duckdb_tables()`) are answered from agentgate's catalog: `public` is exposed
+//!   `duckdb_tables()`) are answered from enact-db's catalog: `public` is exposed
 //!   as DuckDB's `main`, plus `system`
 //! * scans (`SELECT #1, #3 FROM main.t`) are rewritten to DataFusion SQL;
 //!   anything else (`quack_query`) runs on DataFusion as-is
@@ -205,7 +205,7 @@ impl QuackServer {
                 }
                 Ok(wire::success_response())
             }
-            Request::SendData => Err(anyhow!("agentgate's Quack endpoint is read-only")),
+            Request::SendData => Err(anyhow!("enact-db's Quack endpoint is read-only")),
             Request::Prepare { sql, uuid, inline_rows } => {
                 conn.query = None; // a new query supersedes the previous one
                 let (schema, stream) = self.run(&sql).await?;
@@ -289,7 +289,7 @@ impl QuackServer {
         let df = self.ctx.sql_with_options(&translated, opts).await.map_err(|e| {
             let msg = e.to_string();
             if msg.contains("DDL") || msg.contains("DML") || msg.contains("Statement not supported") {
-                anyhow!("agentgate's Quack endpoint is read-only: {msg}")
+                anyhow!("enact-db's Quack endpoint is read-only: {msg}")
             } else {
                 anyhow!(msg)
             }

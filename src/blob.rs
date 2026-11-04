@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BlobConfig {
-    /// e.g. "az://mycontainer/agentgate" or "file:///var/lib/agentgate-blob"
+    /// e.g. "az://mycontainer/enact-db" or "file:///var/lib/enact-db-blob"
     pub url: Option<String>,
     /// Push all open agents every N seconds (0 = only on demand / shutdown).
     #[serde(default)]

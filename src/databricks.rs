@@ -152,7 +152,7 @@ impl DatabricksClient {
         };
         Ok(Self {
             http: reqwest::Client::builder()
-                .user_agent(concat!("agentgate/", env!("CARGO_PKG_VERSION")))
+                .user_agent(concat!("enact-db/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(120))
                 .build()?,
             storage: reqwest::Client::builder().timeout(Duration::from_secs(600)).build()?,
@@ -450,7 +450,7 @@ impl DatabricksTable {
 
     pub fn build_sql(&self, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> String {
         let cols = match projection {
-            Some(p) if p.is_empty() => "1 AS __agentgate_rowcount".to_string(),
+            Some(p) if p.is_empty() => "1 AS __enact_db_rowcount".to_string(),
             Some(p) => p.iter().map(|i| quote_ident(self.schema.field(*i).name())).collect::<Vec<_>>().join(", "),
             None => "*".to_string(),
         };

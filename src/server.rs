@@ -197,7 +197,7 @@ async fn info(State(st): St) -> ApiResult<Json<Value>> {
     )
     .await?;
     Ok(Json(json!({
-        "name": "agentgate",
+        "name": "enact-db",
         "version": env!("CARGO_PKG_VERSION"),
         "features": {
             "azure": cfg!(feature = "azure"), "postgres": cfg!(feature = "postgres"),

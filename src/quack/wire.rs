@@ -327,7 +327,7 @@ pub fn read_request(h: &Header, r: &mut Reader) -> Result<Request> {
 pub fn connection_response(connection_id: &str, heartbeat: u64) -> Vec<u8> {
     let mut w = Writer::new();
     write_header(&mut w, msg::CONNECTION_RESPONSE, connection_id, None);
-    w.prop_string_default(1, concat!("agentgate-", env!("CARGO_PKG_VERSION")));
+    w.prop_string_default(1, concat!("enact-db-", env!("CARGO_PKG_VERSION")));
     w.prop_string_default(2, platform());
     w.prop_uvar_default(3, QUACK_VERSION, 0);
     w.prop_uvar_default(4, heartbeat, 0);

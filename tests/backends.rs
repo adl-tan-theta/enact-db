@@ -1,9 +1,9 @@
 //! Integration tests for the cloud / optional backends against real services.
 //!
 //! Requires a Postgres with pgvector:
-//!   AGENTGATE_TEST_PG="host=127.0.0.1 user=agent password=agentpw dbname=agents" \
+//!   ENACT_DB_TEST_PG="host=127.0.0.1 user=agent password=agentpw dbname=agents" \
 //!   cargo test --features full --test backends
-//! Skips (passes trivially) when AGENTGATE_TEST_PG is unset.
+//! Skips (passes trivially) when ENACT_DB_TEST_PG is unset.
 #![cfg(feature = "postgres")]
 
 use serde_json::{json, Value};
@@ -26,7 +26,7 @@ async fn start(dir: &std::path::Path, toml: &str) -> Server {
         format!("[server]\nlisten = \"127.0.0.1:{port}\"\ndata_dir = \"{}\"\n{toml}", dir.join("data").display()),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agentgate"))
+    let child = Command::new(env!("CARGO_BIN_EXE_enact-db"))
         .arg("--config")
         .arg(&cfg)
         .stdout(Stdio::null())
@@ -44,7 +44,7 @@ async fn start(dir: &std::path::Path, toml: &str) -> Server {
 }
 
 async fn pg() -> Option<(tokio_postgres::Client, String)> {
-    let conn = std::env::var("AGENTGATE_TEST_PG").ok()?;
+    let conn = std::env::var("ENACT_DB_TEST_PG").ok()?;
     let (c, task) = tokio_postgres::connect(&conn, tokio_postgres::NoTls).await.expect("connect test pg");
     tokio::spawn(task);
     Some((c, conn))
@@ -53,7 +53,7 @@ async fn pg() -> Option<(tokio_postgres::Client, String)> {
 #[tokio::test(flavor = "multi_thread")]
 async fn postgres_source_memory_and_transcripts() {
     let Some((pgc, conn)) = pg().await else {
-        eprintln!("AGENTGATE_TEST_PG not set; skipping");
+        eprintln!("ENACT_DB_TEST_PG not set; skipping");
         return;
     };
     pgc.batch_execute(

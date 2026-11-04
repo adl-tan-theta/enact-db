@@ -1,5 +1,5 @@
 [package]
-name = "agentgate"
+name = "enact-db"
 version = "0.1.0"
 edition = "2021"
 description = "Single-binary data gateway: DataFusion federation + AgentFS (Turso) agent state over HTTP"

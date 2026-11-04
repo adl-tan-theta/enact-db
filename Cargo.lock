@@ -111,46 +111,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentgate"
-version = "0.1.0"
-dependencies = [
- "adbc_core",
- "adbc_driver_manager",
- "agentfs-sdk",
- "anyhow",
- "arrow-array 58.4.1",
- "arrow-schema 58.4.1",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "bytes",
- "clap",
- "datafusion 55.2.0",
- "datafusion-table-providers",
- "duckdb",
- "futures",
- "lancedb",
- "native-tls",
- "object_store 0.13.2",
- "postgres-native-tls",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-postgres",
- "tokio-stream",
- "tokio-tungstenite",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "turso",
- "url",
- "yrs",
-]
-
-[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3466,6 +3426,46 @@ name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
+name = "enact-db"
+version = "0.1.0"
+dependencies = [
+ "adbc_core",
+ "adbc_driver_manager",
+ "agentfs-sdk",
+ "anyhow",
+ "arrow-array 58.4.1",
+ "arrow-schema 58.4.1",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "clap",
+ "datafusion 55.2.0",
+ "datafusion-table-providers",
+ "duckdb",
+ "futures",
+ "lancedb",
+ "native-tls",
+ "object_store 0.13.2",
+ "postgres-native-tls",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "url",
+ "yrs",
+]
 
 [[package]]
 name = "encoding_rs"

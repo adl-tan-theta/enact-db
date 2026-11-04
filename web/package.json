@@ -1,7 +1,7 @@
 {
-  "name": "agentgate-web",
+  "name": "enact-db-web",
   "private": true,
-  "description": "Builds src/web/yjs-bundle.js (Yjs + y-websocket) which is embedded into the agentgate binary",
+  "description": "Builds src/web/yjs-bundle.js (Yjs + y-websocket) which is embedded into the enact-db binary",
   "scripts": { "build": "esbuild entry.js --bundle --format=esm --minify --outfile=../src/web/yjs-bundle.js" },
   "devDependencies": { "esbuild": "0.25.10", "yjs": "13.6.27", "y-websocket": "2.1.0" }
 }

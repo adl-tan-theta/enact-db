@@ -3,7 +3,7 @@
 //! The decoder below is an independent re-implementation of DuckDB's
 //! `BinaryDeserializer`, `LogicalType::Deserialize`, `DataChunk::Deserialize`
 //! and `Vector::Deserialize` (V2_0_0 format), written from the C++ sources,
-//! not from agentgate's encoder. Requests are built exactly as the
+//! not from enact-db's encoder. Requests are built exactly as the
 //! duckdb-quack client builds them, including the catalog queries it sends at ATTACH.
 
 use serde_json::json;
@@ -506,7 +506,7 @@ async fn quack_protocol() {
     )
     .unwrap();
     let _srv = Server(
-        Command::new(env!("CARGO_BIN_EXE_agentgate"))
+        Command::new(env!("CARGO_BIN_EXE_enact-db"))
             .arg("--config")
             .arg(dir.path().join("cfg.toml"))
             .stdout(Stdio::null())
