@@ -67,6 +67,23 @@ interval_ms = 1000
 # location = "./examples/regions.csv"
 
 # [[sources]]
+# kind = "databricks"              # SQL Statement Execution API, Arrow results, no driver needed
+# name = "sales"
+# host = "https://adb-1234567890123456.7.azuredatabricks.net"
+# warehouse_id = "abcdef1234567890"
+# table = "main.finance.sales"     # or: query = "SELECT ... FROM ..."
+# token_env = "DATABRICKS_TOKEN"   # PAT / Entra token, or OAuth M2M:
+# # client_id = "<service-principal-application-id>"
+# # client_secret_env = "DATABRICKS_CLIENT_SECRET"
+
+# ---------------------------------------------------------------------------
+# Quack (DuckDB client-server protocol) on the same port:
+#   ATTACH 'quack:localhost:9494' AS gw;  FROM gw.sales;  FROM gw.system.agent_tool_calls;
+# ---------------------------------------------------------------------------
+# [quack]
+# token = "duck-secret"            # defaults to [server] auth_token; unset = open (local dev)
+
+# [[sources]]
 # kind = "snowflake"               # needs --features snowflake + the ADBC Snowflake driver
 # name = "orders"
 # driver = "/opt/adbc/libadbc_driver_snowflake.so"

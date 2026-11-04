@@ -155,6 +155,41 @@ GROUP BY c.name;
 Queries are read-only unless `allow_sql_writes = true`. Agent queries (with
 `X-Agent-Id`) are audited.
 
+### Quack (DuckDB client-server protocol)
+
+agentgate speaks Quack v3 at `POST /quack` on its main port, so any DuckDB can
+attach the whole gateway (federated sources plus live agent state) as a database:
+
+```sql
+CREATE SECRET (TYPE quack, TOKEN 'duck-secret');   -- when a token is configured
+ATTACH 'quack:localhost:9494' AS gw;
+FROM gw.customers;                                 -- Postgres / Databricks / Snowflake / files
+SELECT agent_id, count(*) FROM gw.system.agent_tool_calls GROUP BY ALL;
+FROM quack_query('gw', 'SELECT ... any DataFusion SQL ...');
+```
+
+* At ATTACH, the client's catalog queries (`duckdb_schemas()`/`duckdb_tables()`)
+  are answered from agentgate's catalog: `public` appears as `main`, next to `system`.
+* Scans arrive as `SELECT #1, #3 FROM main.t` and run on DataFusion. Results
+  stream as DuckDB DataChunks: rows are inlined in PREPARE up to `inline_rows`,
+  then sent as FETCH batches. Retries and out-of-order fetch-ahead are served
+  from a cache until the client acknowledges them.
+* Read-only: SEND_DATA, INSERT and DDL are refused with a `Permission`/read-only error.
+* Local hosts connect over plain HTTP. For remote clients, put TLS in front
+  (DuckDB defaults to HTTPS for non-local hosts), or have the client attach with SSL disabled.
+* Types: booleans, all integer widths, FLOAT/DOUBLE, DECIMAL(≤38), VARCHAR,
+  BLOB, DATE, TIME, TIMESTAMP[TZ], INTERVAL, LIST and STRUCT are sent natively.
+  Anything else is sent as VARCHAR.
+
+### Databricks
+
+A `kind = "databricks"` source calls the Databricks SQL Statement Execution API
+directly, so no ODBC/JDBC driver is needed. Results come back as Arrow over
+`EXTERNAL_LINKS` and stream chunk by chunk. Projections, `LIMIT` and simple
+filters are pushed down to the warehouse (filters are re-checked locally). Auth
+is a PAT/Entra token or OAuth M2M with a service principal. The Databricks token
+is never sent to the presigned storage links; only the headers Databricks returns are.
+
 ### Blob artifacts
 
 `PUT/GET /v1/blob/{path}` and `GET /v1/blob` store files under
@@ -175,6 +210,13 @@ node tests/browser.mjs http://127.0.0.1:9494 # two Chromium users + an HTTP agen
   restart persistence, CRDT log compaction, and sandbox push → wipe → pull.
 * `tests/backends.rs` covers a Postgres source joined with agent activity,
   pgvector memory, transcript export to Postgres and DuckDB, and LanceDB memory.
+* `tests/quack.rs` is a Quack v3 conformance test with its own decoder of DuckDB's
+  binary format, written from the C++ sources. It covers the exact ATTACH catalog
+  queries, projected scans, nulls, decimals, lists, 100k rows across PREPARE and
+  FETCH batches (fetch-ahead, retries, terminal total), errors, read-only
+  enforcement and disconnect.
+* `tests/databricks.rs` runs against a mock of the Statement Execution API
+  (polling, multi-chunk Arrow, pushdown SQL, token isolation, error reporting).
 * `tests/browser.mjs` runs the built-in page in Chromium: two humans type and
   an agent edits over HTTP, then it checks that all copies match, that presence
   shows `alice | bob | planner (agent)`, and that the SQL-driven activity feed updates.
@@ -187,19 +229,16 @@ federation (files, Postgres, system tables), and the blob tier (`file://`).
 
 Implemented but not yet verified against the live service: Azure Blob (it goes
 through the same `object_store` code path as `file://`, plus `az://`
-credentials) and Snowflake via ADBC.
+credentials), Snowflake via ADBC, a live Databricks workspace (tested against
+an API-contract mock), and a live DuckDB client over Quack (tested against an
+independent decoder of DuckDB's wire format).
 
 Known upstream issue: in turso 0.4.4, an index on `(x, rowid_alias)` makes
 `x = ? AND rowid_alias > ?` return no rows. `src/store.rs` works around it with
 `+seq`; it's worth reporting upstream.
 
 Next:
-* **Quack (DuckDB wire protocol) endpoint.** Quack is DuckDB's experimental
-  client-server protocol, introduced May 2026. Its wire format is DuckDB's internal binary
-  serializer plus `DataChunk`s over `POST /quack`, with no published spec, so it
-  needs a Rust port of that serialization. Until then, DuckDB clients can query
-  with `read_json`/Arrow over HTTP.
-* **Databricks.** Add an ODBC source (`datafusion-table-providers/odbc`) or
-  the Databricks SQL Statement API as a TableProvider.
+* **Quack writes**: accept SEND_DATA (`INSERT INTO gw...`) into AgentFS/Turso tables.
+* **TLS listener** built in, for remote Quack and HTTPS without a proxy.
 * **Server-side embeddings** (call an embedding model on upsert/search), **per-doc ACLs**, and
   **Turso Cloud sync** for AgentFS (`AgentFSOptions::with_sync`) as an alternative to blob push/pull.

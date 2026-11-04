@@ -54,6 +54,7 @@ pub struct AppState {
     pub sources: Vec<String>,
     pub sinks: Vec<String>,
     pub peer_seq: AtomicU64,
+    pub quack: Arc<crate::quack::QuackServer>,
 }
 
 type St = State<Arc<AppState>>;
@@ -151,6 +152,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("web/index.html")) }))
         .route("/health", get(|| async { "ok" }))
+        // DuckDB Quack protocol: `ATTACH 'quack:host:port' AS gw`. Auth is the token in the
+        // CONNECT message (DuckDB's quack secret), so this sits outside the bearer middleware.
+        .route("/quack", post(quack_post).options(quack_options))
         .route(
             "/static/yjs-bundle.js",
             get(|| async {
@@ -900,4 +904,27 @@ async fn blob_list(State(st): St) -> ApiResult<Json<Value>> {
     let items = blob.list("").await?;
     let list: Vec<Value> = items.into_iter().map(|(k, s)| json!({"key": k, "size": s})).collect();
     Ok(Json(json!({ "url": blob.url, "objects": list })))
+}
+
+// ---- Quack ------------------------------------------------------------------------
+
+async fn quack_post(State(st): St, body: Bytes) -> Response {
+    let resp = st.quack.handle(&body).await;
+    (
+        [(header::CONTENT_TYPE, "application/vnd.duckdb"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        resp,
+    )
+        .into_response()
+}
+
+async fn quack_options() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "*"),
+        ],
+    )
+        .into_response()
 }

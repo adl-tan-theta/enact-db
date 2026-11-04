@@ -15,6 +15,7 @@ mod databricks;
 mod memory;
 #[cfg(feature = "postgres")]
 mod pg;
+mod quack;
 mod server;
 mod store;
 mod systables;
@@ -56,6 +57,15 @@ struct Extra {
     transcripts: transcripts::TranscriptConfig,
     #[serde(default)]
     blob: blob::BlobConfig,
+    #[serde(default)]
+    quack: QuackConfig,
+}
+
+#[derive(Deserialize, Default)]
+struct QuackConfig {
+    /// Token DuckDB clients must present (`CREATE SECRET (TYPE quack, TOKEN '...')`).
+    /// Defaults to [server] auth_token; with neither, the endpoint is open (local dev).
+    token: Option<String>,
 }
 
 #[tokio::main]
@@ -103,7 +113,11 @@ async fn main() -> Result<()> {
     let ctx = catalog::build_context(&cfg.sources).await?;
     systables::register(&ctx, agents.clone(), hub.clone(), store.clone())?;
 
+    let quack_token = extra.quack.token.clone().or_else(|| cfg.server.auth_token.clone());
+    let quack = Arc::new(quack::QuackServer::new(ctx.clone(), quack_token));
+
     let state = Arc::new(server::AppState {
+        quack,
         ctx,
         agents: agents.clone(),
         hub,
