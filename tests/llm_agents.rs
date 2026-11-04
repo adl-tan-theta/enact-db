@@ -147,8 +147,20 @@ async fn llm_agents_follow_model_actions() {
     }
 
     // every exchange is stored in the agent's own AgentFS sandbox
-    let tools: Value = get(format!("{base}/v1/agents/sketch/tools")).await.json().await.unwrap();
-    let llm_call = tools["tool_calls"].as_array().unwrap().iter().find(|t| t["name"] == "llm.respond").expect("llm.respond recorded");
+    // (the agent replies first, then saves the turn and records the call: poll)
+    let mut llm_call = None;
+    for _ in 0..100 {
+        let tools: Value = get(format!("{base}/v1/agents/sketch/tools")).await.json().await.unwrap();
+        llm_call = tools["tool_calls"].as_array().unwrap().iter().find(|t| t["name"] == "llm.respond").cloned();
+        let scribe_done = get(format!("{base}/v1/agents/scribe/fs/llm")).await.json::<Value>().await.unwrap()["entries"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty());
+        if llm_call.is_some() && scribe_done {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let llm_call = llm_call.expect("llm.respond recorded");
     let executed = llm_call["result"]["actions"].as_array().unwrap();
     assert!(executed.iter().any(|a| a.as_str().unwrap().starts_with("skipped: unknown action 'teleport'")), "{llm_call}");
     let listing: Value = get(format!("{base}/v1/agents/scribe/fs/llm")).await.json().await.unwrap();

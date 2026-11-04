@@ -26,13 +26,11 @@ fn embed(text: &str) -> Vec<f32> {
 
 async fn embeddings(Json(req): Json<Value>) -> Json<Value> {
     assert!(req["model"].as_str().unwrap().contains("nemotron"), "default embedding model");
-    let data: Vec<Value> = req["input"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .enumerate()
-        .map(|(i, t)| json!({"index": i, "embedding": embed(t.as_str().unwrap())}))
-        .collect();
+    // like OpenRouter's free endpoints: a single string works, batches do not
+    let data: Vec<Value> = match &req["input"] {
+        Value::String(t) => vec![json!({"index": 0, "embedding": embed(t)})],
+        _ => return Json(json!({"error": {"message": "batched input not supported", "code": 502}})),
+    };
     Json(json!({"data": data, "model": req["model"]}))
 }
 

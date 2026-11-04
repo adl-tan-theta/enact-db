@@ -133,12 +133,47 @@ impl Embedder {
         Some(Self { http, base: base.trim_end_matches('/').to_string(), key, model })
     }
 
+    #[allow(dead_code)] // public helper; agents embed one text at a time
+    /// Embed several texts. Some providers (e.g. OpenRouter's free NVIDIA
+    /// endpoints) reject batched input, so a failed batch is retried one by one.
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.len() == 1 {
+            return Ok(vec![self.embed_one(&texts[0]).await?]);
+        }
+        match self.request(json!(texts), texts.len()).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::debug!(model = %self.model, error = %e, "batched embedding failed; retrying one by one");
+                let mut out = Vec::with_capacity(texts.len());
+                for t in texts {
+                    out.push(self.embed_one(t).await?);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Embed one text (sent as a plain string, which every provider accepts).
+    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        let mut last = None;
+        for attempt in 0..3 {
+            match self.request(json!(text), 1).await {
+                Ok(mut v) => return Ok(v.remove(0)),
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(400 * (attempt + 1))).await;
+                }
+            }
+        }
+        Err(last.unwrap())
+    }
+
+    async fn request(&self, input: Value, expected: usize) -> Result<Vec<Vec<f32>>> {
         let resp = self
             .http
             .post(format!("{}/embeddings", self.base))
             .bearer_auth(&self.key)
-            .json(&json!({"model": self.model, "input": texts}))
+            .json(&json!({"model": self.model, "input": input}))
             .send()
             .await
             .context("embedding request failed")?;
@@ -159,14 +194,10 @@ impl Embedder {
             })
             .collect();
         rows.sort_by_key(|r| r.0);
-        if rows.len() != texts.len() || rows.iter().any(|r| r.1.is_empty()) {
-            bail!("embedding response has {} vectors for {} inputs", rows.len(), texts.len());
+        if rows.len() != expected || rows.iter().any(|r| r.1.is_empty()) {
+            bail!("embedding response has {} vectors for {expected} inputs", rows.len());
         }
         Ok(rows.into_iter().map(|r| r.1).collect())
-    }
-
-    pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
-        Ok(self.embed(&[text.to_string()]).await?.remove(0))
     }
 
     /// Vector size of the model (needed to create the LanceDB table).

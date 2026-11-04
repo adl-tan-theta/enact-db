@@ -120,8 +120,24 @@ The API key is only read from the environment. It's never stored or logged.
 * a follow-up that needs the session history
 * `remember` into LanceDB
 * privacy of the agent's memory
-* recall after a full restart `node tests/demo_llm.mjs target/debug/enact-db` runs
-two humans in Chromium against the real model.
+* recall after a full restart
+
+`node tests/demo_llm.mjs target/debug/enact-db` runs two humans in Chromium
+against the real model. `node tests/memory_live.mjs target/debug/enact-db` runs
+the real model plus OpenRouter embeddings plus LanceDB: scribe is told a decision
+on one document, the process restarts, and scribe is asked about it on another
+document. That document has no shared chat and no session history, so the test
+checks that the fact reached the prompt only through LanceDB recall.
+
+Embedding models (`--embed-model` / `OPENROUTER_EMBED_MODEL`):
+
+| Model | Dimensions | Notes |
+|---|---|---|
+| `nvidia/nemotron-3.5-embed-1b:free` (default) | 2048 | one text per request (batches are rejected; the client sends single strings) |
+| `nvidia/nemotron-3.5-embed-8b:free` | 4096 | one text per request |
+| `amazon/titan-embed-text-v1` | 1536 | batches work |
+
+Each model gets its own LanceDB dataset, so switching models never mixes vector sizes.
 
 The agents are real CRDT peers. They use the same WebSocket protocol, an
 API token, presence, and a sticky cursor that follows concurrent edits. Each
