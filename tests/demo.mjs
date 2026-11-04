@@ -18,7 +18,7 @@ const fail = (m) => { console.error("FAIL:", m); cleanup(); process.exit(1); };
 const step = (m) => console.log("  ✓", m);
 
 const proc = spawn(bin, ["demo", "--listen", `127.0.0.1:${port}`, "--data-dir", join(dir, "data"),
-  "--speed-ms", "12", "--tokens-out", join(dir, "tokens.json")], { stdio: ["ignore", "ignore", "inherit"] });
+  "--speed-ms", "12", "--no-llm", "--tokens-out", join(dir, "tokens.json")], { stdio: ["ignore", "ignore", "inherit"] });
 let browser;
 function cleanup() { try { proc.kill(); } catch (_) {} try { browser && browser.close(); } catch (_) {} }
 process.on("exit", cleanup);

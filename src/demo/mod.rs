@@ -7,6 +7,7 @@
 //! so every edit, drawing and chat message is attributed and audited.
 
 pub mod agent;
+pub mod llm;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -32,6 +33,12 @@ pub struct DemoArgs {
     /// Don't start the built-in agents (run them yourself with `enact-db agent`)
     #[arg(long)]
     pub no_agents: bool,
+    /// LLM model for the agents (OpenAI-compatible; default from OPENAI_COMPATIBLE_MODEL / MiniMax-M3)
+    #[arg(long, env = "OPENAI_COMPATIBLE_MODEL")]
+    pub model: Option<String>,
+    /// Use scripted agents even if OPENAI_COMPATIBLE_* is configured
+    #[arg(long)]
+    pub no_llm: bool,
 }
 
 fn random_token() -> Result<String> {
@@ -119,6 +126,8 @@ pub async fn run(args: DemoArgs) -> Result<()> {
                 doc: doc.into(),
                 speed_ms: args.speed_ms,
                 color: None,
+                model: args.model.clone(),
+                no_llm: args.no_llm,
             };
             tokio::spawn(async move {
                 if let Err(e) = agent::run(a).await {
@@ -143,12 +152,17 @@ pub async fn run(args: DemoArgs) -> Result<()> {
          bob   (editor):  {}\n    \
          carol (viewer):  {}\n\n  \
          Agents scribe (writes) and sketch (draws) are {}.\n  \
+         Agent brain: {}\n  \
          In the chat try: @scribe summarize   @sketch box Risks   @sketch smile\n\n  \
          Admin token (break-glass): {admin_token}\n  Ctrl-C to stop.\n",
         link("alice"),
         link("bob"),
         link("carol"),
-        if args.no_agents { "NOT started (--no-agents)" } else { "already in the document" }
+        if args.no_agents { "NOT started (--no-agents)" } else { "already in the document" },
+        match (args.no_llm, llm::Llm::from_env(args.model.clone())) {
+            (false, Some(l)) => format!("LLM {} (ask them anything with @scribe / @sketch)", l.model),
+            _ => "scripted commands (set OPENAI_COMPATIBLE_BASE_URL / _API_KEY for an LLM)".to_string(),
+        }
     );
 
     server.await??;

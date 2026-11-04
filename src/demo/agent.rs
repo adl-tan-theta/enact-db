@@ -62,12 +62,20 @@ pub struct AgentArgs {
     /// Presence colour
     #[arg(long)]
     pub color: Option<String>,
+    /// LLM model for the agent's brain (OpenAI-compatible; see `demo::llm`)
+    #[arg(long, env = "OPENAI_COMPATIBLE_MODEL")]
+    pub model: Option<String>,
+    /// Use the built-in scripted commands even if an LLM is configured
+    #[arg(long)]
+    pub no_llm: bool,
 }
 
 const REMOTE: &str = "remote";
 
 pub struct Agent {
     pub name: String,
+    persona: String,
+    llm: Option<super::llm::Llm>,
     color: String,
     doc_id: String,
     speed: Duration,
@@ -178,8 +186,15 @@ async fn session(args: &AgentArgs, color: &str) -> Result<()> {
         bail!("no initial sync from server (permission?)");
     }
 
+    let llm = if args.no_llm { None } else { super::llm::Llm::from_env(args.model.clone()) };
+    match &llm {
+        Some(l) => tracing::info!(agent = %args.name, model = %l.model, "agent brain: LLM"),
+        None => tracing::info!(agent = %args.name, "agent brain: scripted commands (no OPENAI_COMPATIBLE_* configured)"),
+    }
     let agent = Arc::new(Agent {
         name: args.name.clone(),
+        persona: args.persona.clone(),
+        llm,
         color: color.to_string(),
         doc_id: args.doc.clone(),
         speed: Duration::from_millis(args.speed_ms.max(1)),
@@ -280,6 +295,12 @@ impl Agent {
     /// the document is never split or interleaved, and types before that anchor
     /// through a sticky index that follows concurrent edits.
     async fn type_at_end(&self, s: &str) {
+        self.type_paragraph(s, false).await
+    }
+
+    /// `by_word`: insert a word (with its whitespace) per step - used for
+    /// longer LLM-written text so it streams in at reading speed.
+    async fn type_paragraph(&self, s: &str, by_word: bool) {
         self.status("typing");
         let sticky = {
             let mut txn = self.doc.transact_mut();
@@ -291,7 +312,24 @@ impl Agent {
             self.text.insert(&mut txn, at, "\n");
             self.text.sticky_index(&txn, at, Assoc::After)
         };
-        for ch in s.trim_start_matches('\n').trim_end_matches('\n').chars() {
+        let body = s.trim_start_matches('\n').trim_end_matches('\n');
+        let pieces: Vec<String> = if by_word {
+            let mut v = vec![];
+            let mut cur = String::new();
+            for ch in body.chars() {
+                cur.push(ch);
+                if ch.is_whitespace() {
+                    v.push(std::mem::take(&mut cur));
+                }
+            }
+            if !cur.is_empty() {
+                v.push(cur);
+            }
+            v
+        } else {
+            body.chars().map(|c| c.to_string()).collect()
+        };
+        for piece in pieces {
             let idx = {
                 let mut txn = self.doc.transact_mut();
                 let at = sticky
@@ -299,11 +337,12 @@ impl Agent {
                     .and_then(|st| st.get_offset(&txn))
                     .map(|o| o.index)
                     .unwrap_or_else(|| self.text.len(&txn));
-                self.text.insert(&mut txn, at, &ch.to_string());
-                at + ch.len_utf16() as u32
+                self.text.insert(&mut txn, at, &piece);
+                at + piece.encode_utf16().count() as u32
             };
             self.set_presence(json!({ "cursor": { "index": idx } }));
-            tokio::time::sleep(if ch == '\n' { self.speed * 4 } else { self.speed }).await;
+            let pause = if piece.ends_with('\n') { self.speed * 4 } else if by_word { self.speed * 2 } else { self.speed };
+            tokio::time::sleep(pause).await;
         }
         self.status("idle");
     }
@@ -503,6 +542,245 @@ impl Agent {
     }
 }
 
+// ---- LLM brain --------------------------------------------------------------------
+
+const MAX_ACTIONS: usize = 12;
+
+fn system_prompt(name: &str, persona: &str) -> String {
+    let role = match persona {
+        "sketch" => "You are the team's visual thinker. You draw on the shared board: boxes, ellipses, \
+                     sticky notes, arrows between labelled shapes, and freehand paths. You do not write \
+                     in the document.",
+        _ => "You are the team's scribe. You write clear, concise markdown into the shared document: \
+              notes, summaries, decisions, plans. Use '## ' headings for new sections. You do not draw.",
+    };
+    format!(
+        "You are {name}, an AI agent collaborating live with humans and other agents in enact-db: \
+         a shared markdown document and a 1000x700 drawing board (origin top-left). {role}\n\n\
+         Respond with ONLY a JSON object, no prose, no code fences:\n\
+         {{\"reply\": \"short chat answer (max 40 words)\", \"actions\": [ ... ]}}\n\
+         Action types (max {MAX_ACTIONS}):\n\
+         - {{\"type\": \"write\", \"text\": \"markdown\"}}  appended to the document as your own paragraph\n\
+         - {{\"type\": \"box\", \"label\": \"...\"}}  rectangle; also \"ellipse\" and \"note\" (sticky note)\n\
+         - {{\"type\": \"arrow\", \"from\": \"label\", \"to\": \"label\"}}  between existing or just-drawn shapes\n\
+         - {{\"type\": \"path\", \"points\": [[x,y], ...]}}  freehand stroke, 2-200 points inside 1000x700\n\
+         Only use actions that fit your role. Keep labels under 24 characters. \
+         If the request is not for you or needs nothing, return an empty actions list."
+    )
+}
+
+impl Agent {
+    /// Ask the LLM what to do about a request, then do it as a CRDT peer.
+    async fn think(self: &Arc<Self>, who: &str, request: &str) {
+        let Some(llm) = self.llm.clone() else { return };
+        self.status("thinking");
+        let started = crate::agents::now_secs();
+        let system = system_prompt(&self.name, &self.persona);
+        let user = self.context(who, request);
+        let result = llm.complete(&system, &user).await;
+        let (raw, usage, latency) = match result {
+            Ok(c) => (c.text, c.usage, c.latency_ms),
+            Err(e) => {
+                tracing::warn!(agent = %self.name, error = %e, "LLM call failed");
+                self.status("idle");
+                self.say(&format!("Sorry {who}, my model call failed ({}). Try again in a moment.", short(&e.to_string(), 120)))
+                    .await;
+                self.tool("llm.respond", json!({"requested_by": who, "request": request, "model": llm.model}), json!({"error": e.to_string()}))
+                    .await;
+                return;
+            }
+        };
+        let parsed = super::llm::extract_json(&raw);
+        let reply = parsed.as_ref().and_then(|v| v["reply"].as_str()).unwrap_or("").to_string();
+        let actions: Vec<Value> = parsed
+            .as_ref()
+            .and_then(|v| v["actions"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_ACTIONS)
+            .collect();
+        if parsed.is_none() {
+            self.say(&format!("Sorry {who}, I couldn't turn that into actions. Could you rephrase?")).await;
+        } else if !reply.is_empty() {
+            self.say(&short(&reply, 400)).await;
+        }
+        let mut done = vec![];
+        for a in &actions {
+            match self.act(a).await {
+                Ok(d) => done.push(d),
+                Err(e) => done.push(format!("skipped: {e}")),
+            }
+        }
+        self.status("idle");
+
+        // Everything about this exchange goes into the agent's own AgentFS sandbox.
+        let record = json!({
+            "ts": now_ms(), "agent": self.name, "persona": self.persona, "model": llm.model,
+            "requested_by": who, "request": request, "system": system, "context": user,
+            "raw_response": raw, "parsed": parsed, "executed": done, "usage": usage, "latency_ms": latency,
+        });
+        let path = format!("/v1/agents/{}/fs/llm/{}-{}.json", self.name, started, self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let _ = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .body(serde_json::to_vec_pretty(&record).unwrap_or_default())
+            .send()
+            .await;
+        self.tool(
+            "llm.respond",
+            json!({"requested_by": who, "request": request, "model": llm.model}),
+            json!({"reply": reply, "actions": done, "latency_ms": latency, "usage": usage}),
+        )
+        .await;
+    }
+
+    /// The live context the model sees.
+    fn context(&self, who: &str, request: &str) -> String {
+        const DOC_LIMIT: usize = 6000;
+        let text = self.text();
+        let doc = if text.chars().count() > DOC_LIMIT {
+            let skip = text.chars().count() - DOC_LIMIT;
+            format!("[...earlier text omitted...]\n{}", text.chars().skip(skip).collect::<String>())
+        } else {
+            text
+        };
+        let shapes: Vec<String> = self
+            .shapes_json()
+            .iter()
+            .take(80)
+            .map(|s| {
+                format!(
+                    "- {} \"{}\" by {} at ({:.0},{:.0}) size {:.0}x{:.0}",
+                    s["kind"].as_str().unwrap_or("?"),
+                    s["label"].as_str().unwrap_or(""),
+                    s["author"].as_str().unwrap_or("?"),
+                    s["x"].as_f64().unwrap_or(0.0),
+                    s["y"].as_f64().unwrap_or(0.0),
+                    s["w"].as_f64().unwrap_or(0.0).abs(),
+                    s["h"].as_f64().unwrap_or(0.0).abs()
+                )
+            })
+            .collect();
+        let chat: Vec<String> = {
+            let txn = self.doc.transact();
+            let mut s = String::new();
+            self.chat.to_json(&txn).to_json(&mut s);
+            let all: Vec<Value> = serde_json::from_str(&s).unwrap_or_default();
+            let n = all.len();
+            all.into_iter()
+                .skip(n.saturating_sub(15))
+                .map(|m| format!("- {}: {}", m["author"].as_str().unwrap_or("?"), m["text"].as_str().unwrap_or("")))
+                .collect()
+        };
+        format!(
+            "Request from {who}: {request}\n\nParticipants online: {}\n\nShared document:\n<<<\n{doc}\n>>>\n\n\
+             Board shapes:\n{}\n\nRecent chat:\n{}\n\nRespond with the JSON object only.",
+            self.participants().join(", "),
+            if shapes.is_empty() { "(empty)".to_string() } else { shapes.join("\n") },
+            chat.join("\n")
+        )
+    }
+
+    /// Execute one model-proposed action. Returns a short description.
+    async fn act(&self, a: &Value) -> Result<String> {
+        let kind = a["type"].as_str().unwrap_or("").to_lowercase();
+        let label = |k: &str| short(a[k].as_str().unwrap_or("").trim(), 40);
+        match kind.as_str() {
+            "write" => {
+                let text = a["text"].as_str().unwrap_or("").trim();
+                if text.is_empty() {
+                    bail!("empty write");
+                }
+                let text = short(text, 3000);
+                self.type_paragraph(&text, true).await;
+                Ok(format!("write {} chars", text.chars().count()))
+            }
+            "box" | "rect" | "rectangle" | "ellipse" | "circle" | "note" | "sticky" => {
+                let k = match kind.as_str() {
+                    "ellipse" | "circle" => "ellipse",
+                    "note" | "sticky" => "note",
+                    _ => "rect",
+                };
+                let (x, y) = self.next_extra_slot();
+                let (w, h) = if k == "ellipse" { (180.0, 100.0) } else if k == "note" { (180.0, 80.0) } else { (200.0, 80.0) };
+                let l = label("label");
+                self.draw_box(k, x, y, w, h, &l).await;
+                Ok(format!("{k} \"{l}\""))
+            }
+            "arrow" => {
+                let (from, to) = (label("from"), label("to"));
+                let shapes = self.shapes_json();
+                let find = |l: &str| {
+                    shapes
+                        .iter()
+                        .rev()
+                        .find(|s| s["label"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(l)) && s["kind"] != "arrow")
+                        .map(|s| {
+                            let (x, y) = (s["x"].as_f64().unwrap_or(0.0), s["y"].as_f64().unwrap_or(0.0));
+                            let (w, h) = (s["w"].as_f64().unwrap_or(0.0), s["h"].as_f64().unwrap_or(0.0));
+                            (x.min(x + w), y.min(y + h), w.abs(), h.abs())
+                        })
+                };
+                let (Some(a1), Some(b1)) = (find(&from), find(&to)) else { bail!("arrow: shape not found ({from} -> {to})") };
+                let (p, q) = edge_points(a1, b1);
+                self.draw_arrow(p.0, p.1, q.0, q.1).await;
+                Ok(format!("arrow {from} -> {to}"))
+            }
+            "path" | "draw" | "pen" => {
+                let pts: Vec<(f64, f64)> = a["points"]
+                    .as_array()
+                    .map(|v| {
+                        v.iter()
+                            .filter_map(|p| Some((p.get(0)?.as_f64()?.clamp(0.0, 1000.0), p.get(1)?.as_f64()?.clamp(0.0, 700.0))))
+                            .take(200)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if pts.len() < 2 {
+                    bail!("path needs at least 2 points");
+                }
+                self.draw_path(&pts).await;
+                Ok(format!("path {} points", pts.len()))
+            }
+            other => bail!("unknown action '{other}'"),
+        }
+    }
+
+    /// Next free slot in this agent's "requested shapes" band (below the section flow).
+    fn next_extra_slot(&self) -> (f64, f64) {
+        let k = self
+            .shapes_json()
+            .iter()
+            .filter(|s| s["author"] == self.name.as_str() && s["kind"] != "arrow" && s["kind"] != "pen" && s["y"].as_f64().unwrap_or(0.0) >= 380.0)
+            .count();
+        (40.0 + (k % 3) as f64 * 250.0, 400.0 + ((k / 3) % 2) as f64 * 130.0)
+    }
+}
+
+/// Arrow endpoints on the borders of two boxes (x, y, w, h), along the line between centres.
+fn edge_points(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> ((f64, f64), (f64, f64)) {
+    let ca = (a.0 + a.2 / 2.0, a.1 + a.3 / 2.0);
+    let cb = (b.0 + b.2 / 2.0, b.1 + b.3 / 2.0);
+    let (dx, dy) = (cb.0 - ca.0, cb.1 - ca.1);
+    let border = |w: f64, h: f64| {
+        let tx = if dx.abs() > 1e-6 { (w / 2.0) / dx.abs() } else { f64::INFINITY };
+        let ty = if dy.abs() > 1e-6 { (h / 2.0) / dy.abs() } else { f64::INFINITY };
+        tx.min(ty)
+    };
+    let ta = border(a.2 + 8.0, a.3 + 8.0);
+    let tb = border(b.2 + 8.0, b.3 + 8.0);
+    ((ca.0 + dx * ta, ca.1 + dy * ta), (cb.0 - dx * tb, cb.1 - dy * tb))
+}
+
+fn short(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
@@ -535,13 +813,21 @@ async fn scribe(a: Arc<Agent>) -> Result<()> {
     tokio::time::sleep(a.speed * 10).await;
     let mut seen = a.chat.len(&a.doc.transact());
     if !a.text().contains("## Agenda (scribe)") {
-        a.say("Hi all, I'm scribe. I'll keep the notes. Ask me: \"@scribe summarize\" or \"@scribe write <text>\".").await;
+        if a.llm.is_some() {
+            a.say("Hi all, I'm scribe (LLM). I'll keep the notes. Ask me anything with @scribe: summaries, plans, decisions, rewrites.").await;
+        } else {
+            a.say("Hi all, I'm scribe. I'll keep the notes. Ask me: \"@scribe summarize\" or \"@scribe write <text>\".").await;
+        }
         a.type_at_end("\n## Agenda (scribe)\n- Goals for this session\n- Open questions\n- Next steps\n").await;
         a.tool("doc.write", json!({"doc": a.doc_id, "section": "Agenda"}), json!("ok")).await;
     }
     loop {
         for msg in a.new_chat(&mut seen) {
             let Some((who, cmd, arg)) = a.command(&msg) else { continue };
+            if a.llm.is_some() {
+                a.think(&who, msg["text"].as_str().unwrap_or_default()).await;
+                continue;
+            }
             match cmd.as_str() {
                 "summarize" | "summary" | "summarise" => {
                     a.say(&format!("On it, {who}! Summarizing the document...")).await;
@@ -578,7 +864,11 @@ async fn scribe(a: Arc<Agent>) -> Result<()> {
 async fn sketch(a: Arc<Agent>) -> Result<()> {
     tokio::time::sleep(a.speed * 25).await;
     let mut seen = a.chat.len(&a.doc.transact());
-    a.say("Hey! I'm sketch. I draw a box for every \"## section\" in the doc. Try \"@sketch box <label>\", \"@sketch circle <label>\", \"@sketch smile\" or \"@sketch clear\".").await;
+    if a.llm.is_some() {
+        a.say("Hey! I'm sketch (LLM). I draw a box for every \"## section\" in the doc, and anything you describe with @sketch: flows, diagrams, notes, doodles.").await;
+    } else {
+        a.say("Hey! I'm sketch. I draw a box for every \"## section\" in the doc. Try \"@sketch box <label>\", \"@sketch circle <label>\", \"@sketch smile\" or \"@sketch clear\".").await;
+    }
 
     // Layout: section boxes flow in a 3-column grid at the top (linked by
     // arrows); shapes requested in chat go in a separate band below, so
@@ -630,6 +920,10 @@ async fn sketch(a: Arc<Agent>) -> Result<()> {
 
         for msg in a.new_chat(&mut seen) {
             let Some((who, cmd, arg)) = a.command(&msg) else { continue };
+            if a.llm.is_some() {
+                a.think(&who, msg["text"].as_str().unwrap_or_default()).await;
+                continue;
+            }
             let label = if arg.is_empty() { "idea".to_string() } else { arg.clone() };
             match cmd.as_str() {
                 "box" | "rect" => {
@@ -700,6 +994,13 @@ async fn sketch(a: Arc<Agent>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_endpoints_sit_on_box_borders() {
+        let (p, q) = edge_points((0.0, 0.0, 200.0, 80.0), (300.0, 0.0, 200.0, 80.0));
+        assert_eq!((p.0.round(), p.1), (204.0, 40.0));
+        assert_eq!((q.0.round(), q.1), (296.0, 40.0));
+    }
 
     #[test]
     fn heading_detection_ignores_partial_last_line() {

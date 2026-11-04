@@ -53,6 +53,48 @@ Open the links in separate windows. Everyone shares one Yjs document with:
 * per-user undo: your Undo only touches your own changes
 * a live activity feed (SQL over `system.agent_tool_calls`)
 
+**LLM agents.** With an OpenAI-compatible endpoint in the environment, the
+agents are driven by a model:
+
+```bash
+export OPENAI_COMPATIBLE_BASE_URL=https://api.minimax.io/v1    # or OpenAI, vLLM, Ollama, LiteLLM…
+export OPENAI_COMPATIBLE_API_KEY=…
+export OPENAI_COMPATIBLE_MODEL=MiniMax-M3                      # default; --model also works
+export OPENAI_COMPATIBLE_MAX_TOKENS=100000                     # default: room for long reasoning
+enact-db demo
+```
+
+On each @mention the agent sends the model:
+* the live document
+* the board's shapes
+* recent chat
+* who is online
+
+The model answers with JSON actions:
+* `write` streams markdown into the document word by word
+* `box`, `ellipse`, `note`, `arrow` (between labelled shapes) and `path` (freehand) are drawn with animation
+* `reply` answers in chat
+
+Reasoning blocks (`<think>…</think>`) and code fences are stripped before
+parsing, and unknown actions are skipped and logged. Without the variables
+(or with `--no-llm`) the agents use the built-in commands.
+
+Where agent data goes:
+
+| Data | Store |
+|---|---|
+| Document, board and chat (CRDT) | `data/hub.db` (Turso), as an update log compacted into snapshots |
+| Each LLM exchange (context, raw reply, parsed actions, executed actions, model, tokens, latency) | the agent's **AgentFS** at `/llm/<ts>.json`, plus an `llm.respond` tool call |
+| Agent actions (`doc.write`, `canvas.draw`, …) | the agent's AgentFS `tool_calls`, which are also queryable as `system.agent_tool_calls` |
+| Chat as a transcript | the outbox in `hub.db`, then DuckDB / Postgres sinks |
+| Permission decisions | `data/authz.db` audit log |
+
+The API key is only read from the environment. It's never stored or logged.
+
+`tests/llm_agents.rs` runs the agents against a mock OpenAI-compatible server
+(deterministic, in CI). `node tests/demo_llm.mjs target/debug/enact-db` runs
+two humans in Chromium against the real model.
+
 The agents are real CRDT peers. They use the same WebSocket protocol, an
 API token, presence, and a sticky cursor that follows concurrent edits. Each
 reserves its own paragraph, so a person typing at the end is never interleaved.
